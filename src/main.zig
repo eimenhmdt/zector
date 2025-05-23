@@ -178,13 +178,23 @@ const VectorStorage = struct {
         const offset = idx * self.dimension * @sizeOf(f32);
         const dest = self.data[offset..][0 .. vector.len * @sizeOf(f32)];
 
-        // Copy and normalize the vector
-        const normalized_vec = try self.allocator.alloc(f32, vector.len);
-        defer self.allocator.free(normalized_vec);
-        @memcpy(normalized_vec, vector);
-        VectorOps.normalize(normalized_vec);
+        // Normalize directly into destination buffer to avoid heap allocation
+        const dest_f32 = @as([*]f32, @ptrCast(@alignCast(dest.ptr)))[0..vector.len];
 
-        @memcpy(dest, mem.sliceAsBytes(normalized_vec));
+        // Copy and accumulate sum of squares
+        var sum: f32 = 0.0;
+        for (vector, 0..) |v, i| {
+            dest_f32[i] = v;
+            sum += v * v;
+        }
+
+        // Normalize in place
+        if (sum > 0) {
+            const inv_norm = 1.0 / @sqrt(sum);
+            for (dest_f32) |*v| {
+                v.* *= inv_norm;
+            }
+        }
 
         self.count += 1;
         return idx;
@@ -862,7 +872,13 @@ test "vector operations" {
     const dot_product = VectorOps.dot(&a, &b);
     try std.testing.expectApproxEqAbs(dot_product, 20.0, 0.001);
 
-    const cosine_dist = VectorOps.cosineDistance(&a, &b);
+    // Normalize vectors for cosine distance since cosineDistance expects unit vectors
+    var norm_a = a;
+    var norm_b = b;
+    VectorOps.normalize(&norm_a);
+    VectorOps.normalize(&norm_b);
+
+    const cosine_dist = VectorOps.cosineDistance(&norm_a, &norm_b);
     try std.testing.expect(cosine_dist >= 0.0 and cosine_dist <= 2.0);
 }
 
@@ -877,7 +893,16 @@ test "vector storage" {
     try std.testing.expectEqual(@as(usize, 0), idx);
 
     const retrieved = storage.getVector(idx);
-    try std.testing.expectEqualSlices(f32, &v1, retrieved);
+
+    // The storage normalizes vectors, so we need to compare with normalized v1
+    var normalized_v1 = v1;
+    VectorOps.normalize(&normalized_v1);
+
+    // Use approximate equality for floating point comparison
+    try std.testing.expectEqual(normalized_v1.len, retrieved.len);
+    for (normalized_v1, retrieved) |expected, actual| {
+        try std.testing.expectApproxEqAbs(expected, actual, 0.0001);
+    }
 }
 
 test "cosine distance consistency" {
