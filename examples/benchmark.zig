@@ -48,7 +48,6 @@ pub fn main() !void {
 
     // Print comparison table
     printComparisonTable(results.items);
-    compareWithOtherDBs();
 }
 
 fn runBenchmark(allocator: std.mem.Allocator, num_vectors: usize, dimension: usize, name: []const u8) !BenchmarkResults {

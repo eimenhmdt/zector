@@ -233,6 +233,8 @@ const HNSWIndex = struct {
         offset: usize,
         len: usize,
         capacity: usize,
+        worst_dist: f32, // Track the worst (largest) distance in this connection list
+        worst_idx: usize, // Index within the connection list of the worst element
     };
 
     const Node = struct {
@@ -243,7 +245,7 @@ const HNSWIndex = struct {
         pub fn init(allocator: mem.Allocator, level: u8) !Node {
             const connections = try allocator.alloc(Connection, level + 1);
             for (connections) |*conn| {
-                conn.* = .{ .offset = 0, .len = 0, .capacity = 0 };
+                conn.* = .{ .offset = 0, .len = 0, .capacity = 0, .worst_dist = -1.0, .worst_idx = 0 };
             }
             return Node{
                 .level = level,
@@ -261,6 +263,9 @@ const HNSWIndex = struct {
     /// Single pool for all edges to avoid allocator churn
     edge_pool: std.ArrayList(usize),
     edge_pool_used: usize,
+    /// Re-usable scratch vectors (grow-once arena)
+    scratch_idx: []usize,
+    scratch_dist: []f32,
     entry_point: ?usize,
     m: usize, // Max connections per layer
     ef_construction: usize,
@@ -274,6 +279,8 @@ const HNSWIndex = struct {
             .nodes = std.ArrayList(Node).init(allocator),
             .edge_pool = std.ArrayList(usize).init(allocator),
             .edge_pool_used = 0,
+            .scratch_idx = &[_]usize{},
+            .scratch_dist = &[_]f32{},
             .entry_point = null,
             .m = m,
             .ef_construction = ef_construction,
@@ -289,6 +296,8 @@ const HNSWIndex = struct {
         }
         self.nodes.deinit();
         self.edge_pool.deinit();
+        if (self.scratch_idx.len > 0) self.allocator.free(self.scratch_idx);
+        if (self.scratch_dist.len > 0) self.allocator.free(self.scratch_dist);
     }
 
     /// Allocate space in the edge pool for `count` connections
@@ -329,7 +338,6 @@ const HNSWIndex = struct {
     ) !void {
         const node = &self.nodes.items[node_idx];
         if (level > node.level) return;
-
         const cap = if (level == 0) self.m * 2 else self.m;
 
         var conn = &node.connections[level];
@@ -339,36 +347,43 @@ const HNSWIndex = struct {
             conn.offset = try self.allocateEdges(cap);
             conn.capacity = cap;
             conn.len = 0;
+            conn.worst_dist = -1.0;
+            conn.worst_idx = 0;
         }
 
         // room left – just push
         if (conn.len < conn.capacity) {
             self.edge_pool.items[conn.offset + conn.len] = neighbor_idx;
+            // Update worst tracking
+            if (dist > conn.worst_dist) {
+                conn.worst_dist = dist;
+                conn.worst_idx = conn.len;
+            }
             conn.len += 1;
             return;
         }
 
-        // list full – find the worst (largest distance)
-        var worst_i: usize = 0;
-        var worst_d: f32 = -1;
-        const vec = storage.getVector(node_idx);
-        const norm = storage.getNorm(node_idx);
-        for (0..conn.len) |i| {
-            const id = self.edge_pool.items[conn.offset + i];
-            const d = VectorOps.cosineDistanceWithNorms(
-                vec,
-                storage.getVector(id),
-                norm,
-                storage.getNorm(id),
-            );
-            if (d > worst_d) {
-                worst_d = d;
-                worst_i = i;
+        // list full – replace worst if new is better
+        if (dist < conn.worst_dist) {
+            self.edge_pool.items[conn.offset + conn.worst_idx] = neighbor_idx;
+
+            // Need to find new worst since we just replaced the old worst
+            conn.worst_dist = -1.0;
+            const vec = storage.getVector(node_idx);
+            const norm = storage.getNorm(node_idx);
+            for (0..conn.len) |i| {
+                const id = self.edge_pool.items[conn.offset + i];
+                const d = VectorOps.cosineDistanceWithNorms(
+                    vec,
+                    storage.getVector(id),
+                    norm,
+                    storage.getNorm(id),
+                );
+                if (d > conn.worst_dist) {
+                    conn.worst_dist = d;
+                    conn.worst_idx = i;
+                }
             }
-        }
-        // keep the better of (new, worst)
-        if (dist < worst_d) {
-            self.edge_pool.items[conn.offset + worst_i] = neighbor_idx;
         }
     }
 
@@ -394,6 +409,7 @@ const HNSWIndex = struct {
         }
 
         const vector = storage.getVector(idx);
+        const vector_norm = storage.getNorm(idx); // Use pre-computed norm from storage
         var nearest = try self.searchLayer(vector, self.entry_point.?, 1, 0, storage);
         defer {
             for (nearest.items) |_| {}
@@ -420,14 +436,14 @@ const HNSWIndex = struct {
         var l: usize = 0;
         while (l <= level) : (l += 1) {
             const m = if (l == 0) self.m * 2 else self.m;
-            const candidates = try self.selectNeighbors(nearest.items, m, vector, math.sqrt(VectorOps.dot(vector, vector)), storage);
+            const candidates = try self.topK(nearest.items, m, vector, vector_norm, storage);
             defer self.allocator.free(candidates);
 
             for (candidates) |neighbor| {
                 const dist = VectorOps.cosineDistanceWithNorms(
                     vector,
                     storage.getVector(neighbor),
-                    math.sqrt(VectorOps.dot(vector, vector)),
+                    vector_norm,
                     storage.getNorm(neighbor),
                 );
                 try self.addConnection(idx, neighbor, l, dist, storage);
@@ -507,48 +523,52 @@ const HNSWIndex = struct {
         return result;
     }
 
-    fn selectNeighbors(
+    /// Efficient top-k selection using scratch buffers and quickselect
+    fn topK(
         self: *HNSWIndex,
         candidates: []usize,
-        m: usize,
-        vector: []const f32,
-        vector_norm: f32,
+        k: usize,
+        base: []const f32,
+        base_norm: f32,
         storage: *const VectorStorage,
     ) ![]usize {
-        if (candidates.len <= m) {
+        if (candidates.len <= k) {
             const result = try self.allocator.alloc(usize, candidates.len);
             @memcpy(result, candidates);
             return result;
         }
 
-        // Calculate distances for all candidates
-        var dists = try self.allocator.alloc(f32, candidates.len);
-        defer self.allocator.free(dists);
+        // Make sure scratch is large enough – grow only when needed
+        if (self.scratch_idx.len < candidates.len) {
+            if (self.scratch_idx.len > 0) self.allocator.free(self.scratch_idx);
+            if (self.scratch_dist.len > 0) self.allocator.free(self.scratch_dist);
+            self.scratch_idx = try self.allocator.alloc(usize, candidates.len);
+            self.scratch_dist = try self.allocator.alloc(f32, candidates.len);
+        }
+
+        // Fill scratch buffers
         for (candidates, 0..) |id, i| {
-            dists[i] = VectorOps.cosineDistanceWithNorms(
-                vector,
+            self.scratch_idx[i] = i; // indices into candidates array
+            self.scratch_dist[i] = VectorOps.cosineDistanceWithNorms(
+                base,
                 storage.getVector(id),
-                vector_norm,
+                base_norm,
                 storage.getNorm(id),
             );
         }
 
-        // Create indices 0..n-1
-        var idx = try self.allocator.alloc(usize, candidates.len);
-        defer self.allocator.free(idx);
-        for (idx, 0..) |*v, i| v.* = i;
-
-        // Sort indices by distance and take the first m
-        std.sort.heap(usize, idx, dists, struct {
+        // Sort indices by distance and take the first k
+        const context = self.scratch_dist[0..candidates.len];
+        std.sort.heap(usize, self.scratch_idx[0..candidates.len], context, struct {
             fn lessThan(ctx: []f32, a: usize, b: usize) bool {
                 return ctx[a] < ctx[b];
             }
         }.lessThan);
 
-        // Return the M closest candidates
-        const result = try self.allocator.alloc(usize, m);
-        for (idx[0..m], 0..) |src, i| {
-            result[i] = candidates[src];
+        // Return the k closest candidates
+        const result = try self.allocator.alloc(usize, k);
+        for (0..k) |i| {
+            result[i] = candidates[self.scratch_idx[i]];
         }
         return result;
     }
