@@ -56,13 +56,13 @@ fn runBenchmark(allocator: std.mem.Allocator, num_vectors: usize, dimension: usi
     // Create database
     var db = try VectorDB.init(allocator, dimension, .{
         .initial_capacity = num_vectors,
-        .index_m = 32, // Increased from 16 for better quality
-        .index_ef_construction = 400, // Higher for better recall
+        .index_m = 48, // Increased for better quality
+        .index_ef_construction = 600, // Higher for better recall
     });
     defer db.deinit();
 
-    // Increase search ef for higher recall
-    db.setSearchEf(200);
+    // Increase search ef for higher recall (≥ 10 × k)
+    db.setSearchEf(512);
 
     // Generate random vectors
     var rng = std.Random.DefaultPrng.init(42);
@@ -84,9 +84,8 @@ fn runBenchmark(allocator: std.mem.Allocator, num_vectors: usize, dimension: usi
     std.debug.print("  Building index...\n", .{});
     const build_start = std.time.milliTimestamp();
 
-    for (vectors) |vec| {
-        _ = try db.addVector(vec, null);
-    }
+    // Use optimized batch insertion
+    try db.addBatch(vectors);
 
     const build_time = @as(f64, @floatFromInt(std.time.milliTimestamp() - build_start));
     const vectors_per_sec = @as(f64, @floatFromInt(num_vectors)) * 1000.0 / build_time;
@@ -127,13 +126,13 @@ fn runBenchmark(allocator: std.mem.Allocator, num_vectors: usize, dimension: usi
         const results = try db.search(query, 10);
         query_times[i] = std.time.microTimestamp() - search_start;
 
-        // Calculate ground truth by brute force (sample 100 vectors for speed)
-        const sample_size = @min(1000, vectors.len);
+        // Calculate ground truth by brute force - use full dataset for ≤ 10K vectors
+        const sample_size = if (vectors.len <= 10_000) vectors.len else @min(1000, vectors.len);
         var ground_truth = try allocator.alloc(struct { idx: usize, distance: f32 }, sample_size);
         defer allocator.free(ground_truth);
 
         for (0..sample_size) |j| {
-            const vec_idx = (i * 17 + j) % vectors.len; // pseudo-random sampling
+            const vec_idx = if (vectors.len <= 10_000) j else (i * 17 + j) % vectors.len; // full or pseudo-random sampling
             var dot_sum: f32 = 0.0;
             for (query, vectors[vec_idx]) |q, v| {
                 dot_sum += q * v;
@@ -225,14 +224,16 @@ fn getMemoryUsage() !usize {
 
 fn printComparisonTable(results: []const BenchmarkResults) void {
     std.debug.print("\n=== Performance Summary ===\n\n", .{});
-    std.debug.print("{s:<30} | {s:>10} | {s:>15} | {s:>12} | {s:>10}\n", .{
+    std.debug.print("{s:<30} | {s:>10} | {s:>15} | {s:>12} | {s:>10} | {s:>11}\n", .{
         "Configuration",
         "Index Time",
         "Throughput",
         "Search Time",
         "QPS",
+        "Recall@10",
     });
-    std.debug.print("{s:-<30} | {s:->10} | {s:->15} | {s:->12} | {s:->10}\n", .{
+    std.debug.print("{s:-<30} | {s:->10} | {s:->15} | {s:->12} | {s:->10} | {s:->11}\n", .{
+        "",
         "",
         "",
         "",
@@ -241,12 +242,13 @@ fn printComparisonTable(results: []const BenchmarkResults) void {
     });
 
     for (results) |r| {
-        std.debug.print("{s:<30} | {d:>8.1} ms | {d:>13.0} v/s | {d:>10.1} μs | {d:>10.0}\n", .{
+        std.debug.print("{s:<30} | {d:>8.1} ms | {d:>13.0} v/s | {d:>10.1} μs | {d:>10.0} | {d:>9.1}%\n", .{
             r.name,
             r.build_time_ms,
             r.vectors_per_sec,
             r.search_time_us,
             r.qps,
+            r.recall_at_10,
         });
     }
 }

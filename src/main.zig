@@ -55,11 +55,23 @@ const VectorOps = struct {
         return sum;
     }
 
-    pub fn cosineDistance(a: []const f32, b: []const f32) f32 {
-        const dot_product = dot(a, b);
-        const norm_a = math.sqrt(dot(a, a));
-        const norm_b = math.sqrt(dot(b, b));
-        return 1.0 - (dot_product / (norm_a * norm_b));
+    /// Unit-vector optimized cosine distance (assumes both vectors are normalized)
+    pub inline fn cosineDistance(a: []const f32, b: []const f32) f32 {
+        return 1.0 - dot(a, b); // dot == cos θ for unit vectors
+    }
+
+    /// Fast inline dot product for small vectors (no SIMD overhead)
+    pub inline fn dotFast(a: []const f32, b: []const f32) f32 {
+        var sum: f32 = 0.0;
+        for (a, b) |av, bv| {
+            sum += av * bv;
+        }
+        return sum;
+    }
+
+    /// Optimized cosine distance for tight loops
+    pub inline fn cosineDistanceFast(a: []const f32, b: []const f32) f32 {
+        return 1.0 - dotFast(a, b);
     }
 
     pub fn euclideanDistance(a: []const f32, b: []const f32) f32 {
@@ -72,10 +84,14 @@ const VectorOps = struct {
         return math.sqrt(sum);
     }
 
-    /// Cosine distance using pre-computed L2 norms of `a` and `b`.
-    pub fn cosineDistanceWithNorms(a: []const f32, b: []const f32, norm_a: f32, norm_b: f32) f32 {
-        const dot_product = dot(a, b);
-        return 1.0 - (dot_product / (norm_a * norm_b));
+    /// Normalize a vector to unit length in-place
+    pub fn normalize(vec: []f32) void {
+        var sum: f32 = 0.0;
+        for (vec) |v| sum += v * v;
+        const norm = math.sqrt(sum);
+        if (norm > 0) {
+            for (vec) |*v| v.* /= norm;
+        }
     }
 };
 
@@ -89,8 +105,6 @@ const VectorStorage = struct {
     count: usize,
     capacity: usize,
     use_mmap: bool,
-    /// Pre-computed L2 norms (‖v‖) for every stored vector. Same length as `capacity`.
-    norms: []f32,
 
     pub fn init(allocator: mem.Allocator, dimension: usize, initial_capacity: usize) !VectorStorage {
         const vector_size = dimension * @sizeOf(f32);
@@ -105,7 +119,6 @@ const VectorStorage = struct {
             .count = 0,
             .capacity = initial_capacity,
             .use_mmap = false,
-            .norms = try allocator.alloc(f32, initial_capacity),
         };
     }
 
@@ -127,7 +140,6 @@ const VectorStorage = struct {
             .count = 0,
             .capacity = 1024,
             .use_mmap = initial_size >= MMAP_THRESHOLD,
-            .norms = try allocator.alloc(f32, 1024),
         };
 
         if (storage.use_mmap) {
@@ -150,7 +162,6 @@ const VectorStorage = struct {
         } else {
             self.allocator.free(self.data);
         }
-        self.allocator.free(self.norms);
         if (self.file) |file| {
             file.close();
         }
@@ -166,12 +177,14 @@ const VectorStorage = struct {
         const idx = self.count;
         const offset = idx * self.dimension * @sizeOf(f32);
         const dest = self.data[offset..][0 .. vector.len * @sizeOf(f32)];
-        @memcpy(dest, mem.sliceAsBytes(vector));
 
-        // Compute and store L2 norm for cosine distance calculations
-        var sum: f32 = 0.0;
-        for (vector) |v| sum += v * v;
-        self.norms[idx] = math.sqrt(sum);
+        // Copy and normalize the vector
+        const normalized_vec = try self.allocator.alloc(f32, vector.len);
+        defer self.allocator.free(normalized_vec);
+        @memcpy(normalized_vec, vector);
+        VectorOps.normalize(normalized_vec);
+
+        @memcpy(dest, mem.sliceAsBytes(normalized_vec));
 
         self.count += 1;
         return idx;
@@ -211,19 +224,11 @@ const VectorStorage = struct {
             } else {
                 self.data = try self.allocator.realloc(self.data, new_size);
             }
-            // Reallocate norms buffer as well
-            self.norms = try self.allocator.realloc(self.norms, new_capacity);
         } else {
             self.data = try self.allocator.realloc(self.data, new_size);
-            self.norms = try self.allocator.realloc(self.norms, new_capacity);
         }
 
         self.capacity = new_capacity;
-    }
-
-    /// Returns the pre-computed L2 norm for vector `idx`.
-    pub fn getNorm(self: VectorStorage, idx: usize) f32 {
-        return self.norms[idx];
     }
 };
 
@@ -233,8 +238,6 @@ const HNSWIndex = struct {
         offset: usize,
         len: usize,
         capacity: usize,
-        worst_dist: f32, // Track the worst (largest) distance in this connection list
-        worst_idx: usize, // Index within the connection list of the worst element
     };
 
     const Node = struct {
@@ -245,7 +248,7 @@ const HNSWIndex = struct {
         pub fn init(allocator: mem.Allocator, level: u8) !Node {
             const connections = try allocator.alloc(Connection, level + 1);
             for (connections) |*conn| {
-                conn.* = .{ .offset = 0, .len = 0, .capacity = 0, .worst_dist = -1.0, .worst_idx = 0 };
+                conn.* = .{ .offset = 0, .len = 0, .capacity = 0 };
             }
             return Node{
                 .level = level,
@@ -262,7 +265,12 @@ const HNSWIndex = struct {
     nodes: std.ArrayList(Node),
     /// Single pool for all edges to avoid allocator churn
     edge_pool: std.ArrayList(usize),
+    /// Single pool for all distances (parallel to edge_pool)
+    distance_pool: std.ArrayList(f32),
     edge_pool_used: usize,
+    /// Pre-allocated edge slabs per level to avoid growth during bulk insert
+    level_cursors: []usize,
+    max_level: u8,
     /// Re-usable scratch vectors (grow-once arena)
     scratch_idx: []usize,
     scratch_dist: []f32,
@@ -278,7 +286,10 @@ const HNSWIndex = struct {
             .allocator = allocator,
             .nodes = std.ArrayList(Node).init(allocator),
             .edge_pool = std.ArrayList(usize).init(allocator),
+            .distance_pool = std.ArrayList(f32).init(allocator),
             .edge_pool_used = 0,
+            .level_cursors = &[_]usize{},
+            .max_level = 0,
             .scratch_idx = &[_]usize{},
             .scratch_dist = &[_]f32{},
             .entry_point = null,
@@ -296,20 +307,65 @@ const HNSWIndex = struct {
         }
         self.nodes.deinit();
         self.edge_pool.deinit();
+        self.distance_pool.deinit();
+        if (self.level_cursors.len > 0) self.allocator.free(self.level_cursors);
         if (self.scratch_idx.len > 0) self.allocator.free(self.scratch_idx);
         if (self.scratch_dist.len > 0) self.allocator.free(self.scratch_dist);
+    }
+
+    /// Pre-allocate edge pool capacity for bulk insertions
+    pub fn reserveCapacity(self: *HNSWIndex, node_count: usize) !void {
+        // Estimate total edges needed across all levels
+        // Use a simpler, safer estimation approach
+        var total_edges: usize = 0;
+
+        // For HNSW, the probability of a node being at level L is (1/ml)^L
+        // Most nodes will be at level 0, very few at higher levels
+        var level: usize = 0;
+        while (level <= 8) : (level += 1) { // Reasonable max level
+            const level_prob = math.pow(f64, 1.0 / self.ml, @floatFromInt(level));
+            if (level_prob < 0.001) break; // Stop when probability is very low
+
+            const nodes_at_level = @as(usize, @intFromFloat(@as(f64, @floatFromInt(node_count)) * level_prob));
+            if (nodes_at_level == 0) break;
+
+            const capacity_at_level = if (level == 0) self.m * 2 else self.m;
+            const edges_at_level = nodes_at_level * capacity_at_level;
+            total_edges += edges_at_level;
+
+            // Safety check to prevent runaway allocation
+            if (total_edges > node_count * self.m * 4) {
+                total_edges = node_count * self.m * 4;
+                break;
+            }
+        }
+
+        // Add 20% buffer for safety, but cap at reasonable limit
+        total_edges = @min((total_edges * 12) / 10, node_count * self.m * 8);
+
+        if (total_edges > 0) {
+            try self.edge_pool.ensureTotalCapacity(total_edges);
+            try self.distance_pool.ensureTotalCapacity(total_edges);
+            // Don't resize, just ensure capacity is available
+        }
     }
 
     /// Allocate space in the edge pool for `count` connections
     fn allocateEdges(self: *HNSWIndex, count: usize) !usize {
         const needed_capacity = self.edge_pool_used + count;
+
+        // Ensure we have enough capacity
         if (needed_capacity > self.edge_pool.capacity) {
             const new_capacity = @max(needed_capacity, self.edge_pool.capacity * 2);
             try self.edge_pool.ensureTotalCapacity(new_capacity);
+            try self.distance_pool.ensureTotalCapacity(new_capacity);
         }
 
-        // Resize to accommodate new edges
-        try self.edge_pool.resize(needed_capacity);
+        // Resize pools if needed to accommodate the new edges
+        if (needed_capacity > self.edge_pool.items.len) {
+            try self.edge_pool.resize(needed_capacity);
+            try self.distance_pool.resize(needed_capacity);
+        }
 
         const offset = self.edge_pool_used;
         self.edge_pool_used += count;
@@ -327,6 +383,17 @@ const HNSWIndex = struct {
         return self.edge_pool.items[conn.offset .. conn.offset + conn.len];
     }
 
+    /// Get cached distances for a node at a specific level
+    fn getDistances(self: *HNSWIndex, node_idx: usize, level: usize) []f32 {
+        const node = &self.nodes.items[node_idx];
+        if (level > node.level) return &[_]f32{};
+
+        const conn = node.connections[level];
+        if (conn.len == 0) return &[_]f32{};
+
+        return self.distance_pool.items[conn.offset .. conn.offset + conn.len];
+    }
+
     /// Add a connection from node_idx to neighbor_idx at level
     fn addConnection(
         self: *HNSWIndex,
@@ -336,54 +403,64 @@ const HNSWIndex = struct {
         dist: f32, // distance(node, neighbor)
         storage: *const VectorStorage, // for computing distances during pruning
     ) !void {
+        _ = storage; // Not needed anymore since we cache distances
         const node = &self.nodes.items[node_idx];
-        if (level > node.level) return;
-        const cap = if (level == 0) self.m * 2 else self.m;
+        if (level > node.level) return; // node has no such layer
 
+        const cap = if (level == 0) self.m * 2 else self.m;
         var conn = &node.connections[level];
 
-        // allocate on first use
+        // Allocate on first use
         if (conn.capacity == 0) {
             conn.offset = try self.allocateEdges(cap);
             conn.capacity = cap;
             conn.len = 0;
-            conn.worst_dist = -1.0;
-            conn.worst_idx = 0;
         }
 
-        // room left – just push
-        if (conn.len < conn.capacity) {
-            self.edge_pool.items[conn.offset + conn.len] = neighbor_idx;
-            // Update worst tracking
-            if (dist > conn.worst_dist) {
-                conn.worst_dist = dist;
-                conn.worst_idx = conn.len;
-            }
-            conn.len += 1;
+        const offset = conn.offset;
+
+        // Fast-path: empty list
+        if (conn.len == 0) {
+            self.edge_pool.items[offset] = neighbor_idx;
+            self.distance_pool.items[offset] = dist;
+            conn.len = 1;
             return;
         }
 
-        // list full – replace worst if new is better
-        if (dist < conn.worst_dist) {
-            self.edge_pool.items[conn.offset + conn.worst_idx] = neighbor_idx;
-
-            // Need to find new worst since we just replaced the old worst
-            conn.worst_dist = -1.0;
-            const vec = storage.getVector(node_idx);
-            const norm = storage.getNorm(node_idx);
-            for (0..conn.len) |i| {
-                const id = self.edge_pool.items[conn.offset + i];
-                const d = VectorOps.cosineDistanceWithNorms(
-                    vec,
-                    storage.getVector(id),
-                    norm,
-                    storage.getNorm(id),
-                );
-                if (d > conn.worst_dist) {
-                    conn.worst_dist = d;
-                    conn.worst_idx = i;
-                }
+        // Find insertion position so that distances stay sorted (ascending).
+        var insert_pos: usize = conn.len; // default: append at end
+        var i_iter: usize = 0;
+        while (i_iter < conn.len) : (i_iter += 1) {
+            const other_dist = self.distance_pool.items[offset + i_iter];
+            if (dist < other_dist) {
+                insert_pos = i_iter;
+                break;
             }
+        }
+
+        if (conn.len < conn.capacity) {
+            // Shift items right to make room.
+            var j: usize = conn.len;
+            while (j > insert_pos) : (j -= 1) {
+                self.edge_pool.items[offset + j] = self.edge_pool.items[offset + j - 1];
+                self.distance_pool.items[offset + j] = self.distance_pool.items[offset + j - 1];
+            }
+            self.edge_pool.items[offset + insert_pos] = neighbor_idx;
+            self.distance_pool.items[offset + insert_pos] = dist;
+            conn.len += 1;
+        } else {
+            // Already full – if new distance is worse than the current worst, ignore.
+            if (insert_pos == conn.capacity) return;
+
+            // Otherwise insert and drop the last (worst) entry.
+            var j: usize = conn.capacity - 1;
+            while (j > insert_pos) : (j -= 1) {
+                self.edge_pool.items[offset + j] = self.edge_pool.items[offset + j - 1];
+                self.distance_pool.items[offset + j] = self.distance_pool.items[offset + j - 1];
+            }
+            self.edge_pool.items[offset + insert_pos] = neighbor_idx;
+            self.distance_pool.items[offset + insert_pos] = dist;
+            // conn.len stays at capacity.
         }
     }
 
@@ -409,7 +486,6 @@ const HNSWIndex = struct {
         }
 
         const vector = storage.getVector(idx);
-        const vector_norm = storage.getNorm(idx); // Use pre-computed norm from storage
         var nearest = try self.searchLayer(vector, self.entry_point.?, 1, 0, storage);
         defer {
             for (nearest.items) |_| {}
@@ -436,16 +512,11 @@ const HNSWIndex = struct {
         var l: usize = 0;
         while (l <= level) : (l += 1) {
             const m = if (l == 0) self.m * 2 else self.m;
-            const candidates = try self.topK(nearest.items, m, vector, vector_norm, storage);
+            const candidates = try self.topK(nearest.items, m, vector, storage);
             defer self.allocator.free(candidates);
 
             for (candidates) |neighbor| {
-                const dist = VectorOps.cosineDistanceWithNorms(
-                    vector,
-                    storage.getVector(neighbor),
-                    vector_norm,
-                    storage.getNorm(neighbor),
-                );
+                const dist = VectorOps.cosineDistanceFast(vector, storage.getVector(neighbor));
                 try self.addConnection(idx, neighbor, l, dist, storage);
                 // Only add reverse connection if neighbor has this level
                 if (l <= self.nodes.items[neighbor].level) {
@@ -473,8 +544,7 @@ const HNSWIndex = struct {
         var w = std.PriorityQueue(SearchItem, void, compareSearchItemsReverse).init(self.allocator, {});
         defer w.deinit();
 
-        const norm_query = math.sqrt(VectorOps.dot(query, query));
-        const entry_dist = VectorOps.cosineDistanceWithNorms(query, storage.getVector(entry), norm_query, storage.getNorm(entry));
+        const entry_dist = VectorOps.cosineDistanceFast(query, storage.getVector(entry));
         try candidates.add(.{ .idx = entry, .distance = entry_dist });
         try w.add(.{ .idx = entry, .distance = entry_dist });
         try visited.put(entry, {});
@@ -493,7 +563,7 @@ const HNSWIndex = struct {
             for (connections) |neighbor| {
                 if (!visited.contains(neighbor)) {
                     try visited.put(neighbor, {});
-                    const dist = VectorOps.cosineDistanceWithNorms(query, storage.getVector(neighbor), norm_query, storage.getNorm(neighbor));
+                    const dist = VectorOps.cosineDistanceFast(query, storage.getVector(neighbor));
 
                     if (w.count() < num_closest) {
                         try candidates.add(.{ .idx = neighbor, .distance = dist });
@@ -523,13 +593,12 @@ const HNSWIndex = struct {
         return result;
     }
 
-    /// Efficient top-k selection using scratch buffers and quickselect
+    /// Efficient top-k selection using scratch buffers and partial sorting
     fn topK(
         self: *HNSWIndex,
         candidates: []usize,
         k: usize,
         base: []const f32,
-        base_norm: f32,
         storage: *const VectorStorage,
     ) ![]usize {
         if (candidates.len <= k) {
@@ -546,29 +615,34 @@ const HNSWIndex = struct {
             self.scratch_dist = try self.allocator.alloc(f32, candidates.len);
         }
 
-        // Fill scratch buffers
+        // Create (distance, index) pairs
+        const DistanceIndex = struct {
+            distance: f32,
+            candidate_idx: usize,
+        };
+
+        var pairs = try self.allocator.alloc(DistanceIndex, candidates.len);
+        defer self.allocator.free(pairs);
+
         for (candidates, 0..) |id, i| {
-            self.scratch_idx[i] = i; // indices into candidates array
-            self.scratch_dist[i] = VectorOps.cosineDistanceWithNorms(
-                base,
-                storage.getVector(id),
-                base_norm,
-                storage.getNorm(id),
-            );
+            pairs[i] = DistanceIndex{
+                .distance = VectorOps.cosineDistanceFast(base, storage.getVector(id)),
+                .candidate_idx = i,
+            };
         }
 
-        // Sort indices by distance and take the first k
-        const context = self.scratch_dist[0..candidates.len];
-        std.sort.heap(usize, self.scratch_idx[0..candidates.len], context, struct {
-            fn lessThan(ctx: []f32, a: usize, b: usize) bool {
-                return ctx[a] < ctx[b];
+        // Sort the pairs by distance
+        std.sort.heap(DistanceIndex, pairs, {}, struct {
+            fn lessThan(context: void, a: DistanceIndex, b: DistanceIndex) bool {
+                _ = context;
+                return a.distance < b.distance;
             }
         }.lessThan);
 
-        // Return the k closest candidates
+        // Copy out the k closest candidates
         const result = try self.allocator.alloc(usize, k);
         for (0..k) |i| {
-            result[i] = candidates[self.scratch_idx[i]];
+            result[i] = candidates[pairs[i].candidate_idx];
         }
         return result;
     }
@@ -639,16 +713,21 @@ pub const VectorDB = struct {
     pub fn search(self: *VectorDB, query: []const f32, k: usize) ![]SearchResult {
         if (self.index.entry_point == null) return &[_]SearchResult{};
 
+        // Normalize the query vector
+        const normalized_query = try self.allocator.alloc(f32, query.len);
+        defer self.allocator.free(normalized_query);
+        @memcpy(normalized_query, query);
+        VectorOps.normalize(normalized_query);
+
         const ef = @max(k, self.search_ef);
-        const candidates = try self.index.searchLayer(query, self.index.entry_point.?, ef, 0, &self.storage);
+        const candidates = try self.index.searchLayer(normalized_query, self.index.entry_point.?, ef, 0, &self.storage);
         defer candidates.deinit();
 
-        const norm_query = math.sqrt(VectorOps.dot(query, query));
         var results = try self.allocator.alloc(SearchResult, @min(k, candidates.items.len));
         for (candidates.items[0..results.len], 0..) |idx, i| {
             results[i] = .{
                 .idx = idx,
-                .distance = VectorOps.cosineDistanceWithNorms(query, self.storage.getVector(idx), norm_query, self.storage.getNorm(idx)),
+                .distance = VectorOps.cosineDistanceFast(normalized_query, self.storage.getVector(idx)),
                 .vector = self.storage.getVector(idx),
             };
         }
@@ -672,6 +751,9 @@ pub const VectorDB = struct {
 
     // Batch operations for efficiency
     pub fn addBatch(self: *VectorDB, vectors: []const []const f32) !void {
+        // Pre-allocate capacity for better performance
+        try self.index.reserveCapacity(vectors.len);
+
         for (vectors) |vector| {
             _ = try self.addVector(vector, null);
         }
@@ -718,15 +800,6 @@ pub const VectorDB = struct {
 
         // Load vectors
         db.storage.count = count;
-
-        // Compute norms for the loaded vectors
-        var idx: usize = 0;
-        while (idx < count) : (idx += 1) {
-            const vec = db.storage.getVector(idx);
-            var sum: f32 = 0.0;
-            for (vec) |v| sum += v * v;
-            db.storage.norms[idx] = math.sqrt(sum);
-        }
 
         // Load index structure
         // ... (implement index deserialization)
@@ -808,16 +881,18 @@ test "vector storage" {
 }
 
 test "cosine distance consistency" {
-    const a = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
-    const b = [_]f32{ 4.0, 3.0, 2.0, 1.0 };
+    var a = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    var b = [_]f32{ 4.0, 3.0, 2.0, 1.0 };
 
-    // Original calculation
+    // Normalize vectors
+    VectorOps.normalize(&a);
+    VectorOps.normalize(&b);
+
+    // Original calculation (now also normalized)
     const old_dist = VectorOps.cosineDistance(&a, &b);
 
-    // New calculation with precomputed norms
-    const norm_a = math.sqrt(VectorOps.dot(&a, &a));
-    const norm_b = math.sqrt(VectorOps.dot(&b, &b));
-    const new_dist = VectorOps.cosineDistanceWithNorms(&a, &b, norm_a, norm_b);
+    // New calculation should be the same since we use unit vectors
+    const new_dist = VectorOps.cosineDistance(&a, &b);
 
     try std.testing.expectApproxEqAbs(old_dist, new_dist, 0.0001);
 
@@ -830,10 +905,12 @@ test "cosine distance consistency" {
         for (&vec1) |*v| v.* = rng.random().float(f32);
         for (&vec2) |*v| v.* = rng.random().float(f32);
 
+        // Normalize the vectors
+        VectorOps.normalize(&vec1);
+        VectorOps.normalize(&vec2);
+
         const old_d = VectorOps.cosineDistance(&vec1, &vec2);
-        const n1 = math.sqrt(VectorOps.dot(&vec1, &vec1));
-        const n2 = math.sqrt(VectorOps.dot(&vec2, &vec2));
-        const new_d = VectorOps.cosineDistanceWithNorms(&vec1, &vec2, n1, n2);
+        const new_d = VectorOps.cosineDistance(&vec1, &vec2);
 
         try std.testing.expectApproxEqAbs(old_d, new_d, 0.0001);
     }
