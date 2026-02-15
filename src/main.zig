@@ -1373,10 +1373,8 @@ pub const VectorDB = struct {
 
         var results = try self.allocator.alloc(SearchResult, @min(k, candidates.items.len));
 
-        // Compute distances in parallel if possible
         for (candidates.items[0..results.len], 0..) |idx, i| {
             const vec = self.storage.getVector(idx);
-            // Prefetch next vector
             if (i + 1 < results.len) {
                 const next_vec = self.storage.getVector(candidates.items[i + 1]);
                 @prefetch(next_vec.ptr, .{ .rw = .read, .locality = 2, .cache = .data });
