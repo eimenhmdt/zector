@@ -1678,7 +1678,7 @@ pub const VectorDB = struct {
         };
 
         const nlist = self.ivf_offsets.len;
-        const probes = @min(self.ivf_probes, nlist);
+        const probes = std.math.clamp(@max(self.ivf_probes, self.search_ef / 64), 1, nlist);
         if (probes == 0) return self.searchHnsw(normalized_query, k);
 
         var probe_lists = try self.allocator.alloc(ProbeCandidate, probes);
@@ -1739,8 +1739,8 @@ pub const VectorDB = struct {
             query_q8[i] = quantizeValue(v);
         }
 
-        const local_cap = @min(total_candidates, @max(k * self.ivf_rerank_factor * 2, 64));
         const thread_count = @max(1, @min(std.Thread.getCpuCount() catch 1, probe_len));
+        const chunk_size = (probe_len + thread_count - 1) / thread_count;
 
         var local_buffers = try self.allocator.alloc([]ApproxCandidate, thread_count);
         defer {
@@ -1752,8 +1752,24 @@ pub const VectorDB = struct {
         defer self.allocator.free(local_lens);
         @memset(local_lens, 0);
 
+        var chunk_starts = try self.allocator.alloc(usize, thread_count);
+        defer self.allocator.free(chunk_starts);
+        var chunk_ends = try self.allocator.alloc(usize, thread_count);
+        defer self.allocator.free(chunk_ends);
+
         for (0..thread_count) |i| {
-            local_buffers[i] = try self.allocator.alloc(ApproxCandidate, local_cap);
+            const start = i * chunk_size;
+            const end = @min(start + chunk_size, probe_len);
+            chunk_starts[i] = start;
+            chunk_ends[i] = end;
+
+            var cap: usize = 0;
+            if (start < end) {
+                for (probe_lists[start..end]) |probe| {
+                    cap += self.ivf_lengths[probe.idx];
+                }
+            }
+            local_buffers[i] = try self.allocator.alloc(ApproxCandidate, cap);
         }
 
         const Context = struct {
@@ -1767,8 +1783,6 @@ pub const VectorDB = struct {
 
             fn run(ctx: @This()) void {
                 var len: usize = 0;
-                var worst_pos: usize = 0;
-                var worst_dist: f32 = -std.math.inf(f32);
                 const dim = ctx.db.storage.dimension;
 
                 for (ctx.start..ctx.end) |probe_i| {
@@ -1787,34 +1801,12 @@ pub const VectorDB = struct {
                         }
 
                         const approx_dist = 1.0 - @as(f32, @floatFromInt(dot_i32)) * INT8_INV_SCALE_SQ;
-                        if (len < ctx.out.len) {
-                            ctx.out[len] = .{
-                                .idx = idx,
-                                .approx_distance = approx_dist,
-                            };
-                            if (approx_dist > worst_dist) {
-                                worst_dist = approx_dist;
-                                worst_pos = len;
-                            }
-                            len += 1;
-                            continue;
-                        }
-
-                        if (approx_dist >= worst_dist) continue;
-
-                        ctx.out[worst_pos] = .{
+                        if (len >= ctx.out.len) continue;
+                        ctx.out[len] = .{
                             .idx = idx,
                             .approx_distance = approx_dist,
                         };
-                        worst_pos = 0;
-                        worst_dist = ctx.out[0].approx_distance;
-                        var t: usize = 1;
-                        while (t < len) : (t += 1) {
-                            if (ctx.out[t].approx_distance > worst_dist) {
-                                worst_dist = ctx.out[t].approx_distance;
-                                worst_pos = t;
-                            }
-                        }
+                        len += 1;
                     }
                 }
 
@@ -1822,20 +1814,17 @@ pub const VectorDB = struct {
             }
         };
 
-        const chunk_size = (probe_len + thread_count - 1) / thread_count;
         if (thread_count > 1 and probe_len > 1) {
             const threads = try self.allocator.alloc(std.Thread, thread_count);
             defer self.allocator.free(threads);
 
             for (threads, 0..) |*thread, i| {
-                const start = i * chunk_size;
-                const end = @min(start + chunk_size, probe_len);
                 const ctx = Context{
                     .db = self,
                     .probes = probe_lists[0..probe_len],
                     .query_q8 = query_q8,
-                    .start = start,
-                    .end = end,
+                    .start = chunk_starts[i],
+                    .end = chunk_ends[i],
                     .out = local_buffers[i],
                     .out_len = &local_lens[i],
                 };
@@ -1848,64 +1837,56 @@ pub const VectorDB = struct {
                 .db = self,
                 .probes = probe_lists[0..probe_len],
                 .query_q8 = query_q8,
-                .start = 0,
-                .end = probe_len,
+                .start = chunk_starts[0],
+                .end = chunk_ends[0],
                 .out = local_buffers[0],
                 .out_len = &local_lens[0],
             };
             Context.run(ctx);
         }
 
-        const merged_cap = @min(total_candidates, @max(k * self.ivf_rerank_factor * 4, 128));
-        var merged = try self.allocator.alloc(ApproxCandidate, merged_cap);
-        defer self.allocator.free(merged);
-        var merged_len: usize = 0;
-        var merged_worst_pos: usize = 0;
-        var merged_worst_dist: f32 = -std.math.inf(f32);
+        const hnsw_assist_ef = if (self.search_ef >= 256 and self.index.entry_point != null)
+            std.math.clamp(@max(self.search_ef, k * 16), k, self.storage.count)
+        else
+            0;
+        var hnsw_assist = if (hnsw_assist_ef > 0 and self.index.entry_point != null)
+            try self.index.searchLayer(normalized_query, self.index.entry_point.?, hnsw_assist_ef, 0, &self.storage)
+        else
+            std.ArrayList(usize).init(self.allocator);
+        defer hnsw_assist.deinit();
+
+        const candidate_cap = total_candidates + hnsw_assist.items.len;
+        var candidate_ids = try self.allocator.alloc(usize, candidate_cap);
+        defer self.allocator.free(candidate_ids);
+        var candidate_len: usize = 0;
+
+        const BitSet = std.DynamicBitSetUnmanaged;
+        var seen = try BitSet.initEmpty(self.allocator, self.storage.count);
+        defer seen.deinit(self.allocator);
 
         for (0..thread_count) |i| {
             const local = local_buffers[i][0..local_lens[i]];
             for (local) |cand| {
-                if (merged_len < merged_cap) {
-                    merged[merged_len] = cand;
-                    if (cand.approx_distance > merged_worst_dist) {
-                        merged_worst_dist = cand.approx_distance;
-                        merged_worst_pos = merged_len;
-                    }
-                    merged_len += 1;
-                    continue;
-                }
-
-                if (cand.approx_distance >= merged_worst_dist) continue;
-                merged[merged_worst_pos] = cand;
-
-                merged_worst_pos = 0;
-                merged_worst_dist = merged[0].approx_distance;
-                var t: usize = 1;
-                while (t < merged_len) : (t += 1) {
-                    if (merged[t].approx_distance > merged_worst_dist) {
-                        merged_worst_dist = merged[t].approx_distance;
-                        merged_worst_pos = t;
-                    }
-                }
+                if (seen.isSet(cand.idx)) continue;
+                seen.set(cand.idx);
+                candidate_ids[candidate_len] = cand.idx;
+                candidate_len += 1;
             }
         }
 
-        if (merged_len == 0) return self.searchHnsw(normalized_query, k);
+        for (hnsw_assist.items) |idx| {
+            if (seen.isSet(idx)) continue;
+            seen.set(idx);
+            candidate_ids[candidate_len] = idx;
+            candidate_len += 1;
+        }
 
-        std.sort.heap(ApproxCandidate, merged[0..merged_len], {}, struct {
-            fn lessThan(context: void, a: ApproxCandidate, b: ApproxCandidate) bool {
-                _ = context;
-                return a.approx_distance < b.approx_distance;
-            }
-        }.lessThan);
+        if (candidate_len == 0) return self.searchHnsw(normalized_query, k);
 
-        const rerank_count = @min(merged_len, @max(k * self.ivf_rerank_factor, k));
-        var reranked = try self.allocator.alloc(SearchResult, rerank_count);
+        var reranked = try self.allocator.alloc(SearchResult, candidate_len);
         defer self.allocator.free(reranked);
 
-        for (0..rerank_count) |i| {
-            const idx = merged[i].idx;
+        for (candidate_ids[0..candidate_len], 0..) |idx, i| {
             const vec = self.storage.getVector(idx);
             reranked[i] = .{
                 .idx = idx,
@@ -1921,7 +1902,7 @@ pub const VectorDB = struct {
             }
         }.lessThan);
 
-        const out_len = @min(k, rerank_count);
+        const out_len = @min(k, candidate_len);
         const out = try self.allocator.alloc(SearchResult, out_len);
         @memcpy(out, reranked[0..out_len]);
         return out;
