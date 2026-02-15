@@ -18,6 +18,7 @@ const IVF_MIN_VECTORS_DEFAULT = 8192;
 const IVF_MIN_LISTS = 16;
 const IVF_MAX_LISTS = 512;
 const IVF_DEFAULT_PROBES = 8;
+const STORAGE_SLAB_VECTORS = 16_384;
 
 // Vector operations using SIMD when available
 const VectorOps = struct {
@@ -338,9 +339,12 @@ const VectorStorage = struct {
     file: ?fs.File,
     data: []align(VECTOR_ALIGNMENT) u8,
     mmap_data: ?[]align(PAGE_ALIGNMENT) u8,
+    slabs: std.ArrayList([]align(VECTOR_ALIGNMENT) u8),
     dimension: usize,
     count: usize,
     capacity: usize,
+    slab_capacity_vectors: usize,
+    use_slabs: bool,
     use_mmap: bool,
     // Quantization support for memory efficiency
     quantized_data: ?[]align(CACHE_LINE_SIZE) u8,
@@ -348,22 +352,33 @@ const VectorStorage = struct {
     quantization_bits: u8,
 
     pub fn init(allocator: mem.Allocator, dimension: usize, initial_capacity: usize) !VectorStorage {
-        const vector_size = dimension * @sizeOf(f32);
-        const data_size = initial_capacity * vector_size;
-
-        return VectorStorage{
+        var storage = VectorStorage{
             .allocator = allocator,
             .file = null,
-            .data = try allocator.alignedAlloc(u8, VECTOR_ALIGNMENT, data_size),
+            .data = undefined,
             .mmap_data = null,
+            .slabs = std.ArrayList([]align(VECTOR_ALIGNMENT) u8).init(allocator),
             .dimension = dimension,
             .count = 0,
-            .capacity = initial_capacity,
+            .capacity = 0,
+            .slab_capacity_vectors = @max(STORAGE_SLAB_VECTORS, initial_capacity),
+            .use_slabs = true,
             .use_mmap = false,
             .quantized_data = null,
             .use_quantization = false,
             .quantization_bits = 8,
         };
+        errdefer storage.deinit();
+
+        while (storage.capacity < initial_capacity) {
+            try storage.addSlab(storage.slab_capacity_vectors);
+        }
+        if (storage.capacity == 0) {
+            try storage.addSlab(storage.slab_capacity_vectors);
+        }
+        storage.data = storage.slabs.items[0];
+
+        return storage;
     }
 
     pub fn initWithFile(allocator: mem.Allocator, path: []const u8, dimension: usize) !VectorStorage {
@@ -380,9 +395,12 @@ const VectorStorage = struct {
             .file = file,
             .data = undefined,
             .mmap_data = null,
+            .slabs = std.ArrayList([]align(VECTOR_ALIGNMENT) u8).init(allocator),
             .dimension = dimension,
             .count = 0,
             .capacity = 1024,
+            .slab_capacity_vectors = 0,
+            .use_slabs = false,
             .use_mmap = initial_size >= MMAP_THRESHOLD,
             .quantized_data = null,
             .use_quantization = false,
@@ -402,15 +420,34 @@ const VectorStorage = struct {
     }
 
     pub fn deinit(self: *VectorStorage) void {
-        if (self.use_mmap) {
-            if (self.mmap_data) |mmap_data| {
-                std.posix.munmap(mmap_data);
+        if (self.use_slabs) {
+            for (self.slabs.items) |slab| {
+                self.allocator.free(slab);
             }
+            self.slabs.deinit();
         } else {
-            self.allocator.free(self.data);
+            if (self.use_mmap) {
+                if (self.mmap_data) |mmap_data| {
+                    std.posix.munmap(mmap_data);
+                }
+            } else if (self.data.len > 0) {
+                self.allocator.free(self.data);
+            }
+            self.slabs.deinit();
         }
         if (self.file) |file| {
             file.close();
+        }
+    }
+
+    fn addSlab(self: *VectorStorage, vectors: usize) !void {
+        const vector_size = self.dimension * @sizeOf(f32);
+        const slab_size = vectors * vector_size;
+        const slab = try self.allocator.alignedAlloc(u8, VECTOR_ALIGNMENT, slab_size);
+        try self.slabs.append(slab);
+        self.capacity += vectors;
+        if (self.slabs.items.len == 1) {
+            self.data = slab;
         }
     }
 
@@ -418,8 +455,17 @@ const VectorStorage = struct {
         std.debug.assert(idx < self.capacity);
         std.debug.assert(vector.len == self.dimension);
 
-        const offset = idx * self.dimension * @sizeOf(f32);
-        const dest = self.data[offset..][0 .. vector.len * @sizeOf(f32)];
+        const vector_size = self.dimension * @sizeOf(f32);
+        const dest = if (self.use_slabs) blk: {
+            const slab_idx = idx / self.slab_capacity_vectors;
+            const in_slab = idx % self.slab_capacity_vectors;
+            const slab = self.slabs.items[slab_idx];
+            const offset = in_slab * vector_size;
+            break :blk slab[offset..][0..vector_size];
+        } else blk: {
+            const offset = idx * vector_size;
+            break :blk self.data[offset..][0..vector_size];
+        };
         const dest_f32 = @as([*]f32, @ptrCast(@alignCast(dest.ptr)))[0..vector.len];
 
         var sum: f32 = 0.0;
@@ -451,8 +497,17 @@ const VectorStorage = struct {
 
     pub fn getVector(self: VectorStorage, idx: usize) []const f32 {
         std.debug.assert(idx < self.count);
-        const offset = idx * self.dimension * @sizeOf(f32);
-        const bytes = self.data[offset..][0 .. self.dimension * @sizeOf(f32)];
+        const vector_size = self.dimension * @sizeOf(f32);
+        const bytes = if (self.use_slabs) blk: {
+            const slab_idx = idx / self.slab_capacity_vectors;
+            const in_slab = idx % self.slab_capacity_vectors;
+            const slab = self.slabs.items[slab_idx];
+            const offset = in_slab * vector_size;
+            break :blk slab[offset..][0..vector_size];
+        } else blk: {
+            const offset = idx * vector_size;
+            break :blk self.data[offset..][0..vector_size];
+        };
         return @as([*]const f32, @ptrCast(@alignCast(bytes.ptr)))[0..self.dimension];
     }
 
@@ -460,6 +515,13 @@ const VectorStorage = struct {
     pub fn reserveCapacity(self: *VectorStorage, additional_count: usize) !void {
         const needed_capacity = self.count + additional_count;
         if (needed_capacity <= self.capacity) return; // Already have enough capacity
+
+        if (self.use_slabs) {
+            while (self.capacity < needed_capacity) {
+                try self.addSlab(self.slab_capacity_vectors);
+            }
+            return;
+        }
 
         // Grow to at least the needed capacity
         var new_capacity = self.capacity;
@@ -554,6 +616,11 @@ const VectorStorage = struct {
     }
 
     fn grow(self: *VectorStorage) !void {
+        if (self.use_slabs) {
+            try self.addSlab(self.slab_capacity_vectors);
+            return;
+        }
+
         const new_capacity = self.capacity * 2;
         const vector_size = self.dimension * @sizeOf(f32);
         const new_size = new_capacity * vector_size;
@@ -617,6 +684,19 @@ const HNSWIndex = struct {
         }
     };
 
+    const SearchItem = struct {
+        idx: usize,
+        distance: f32,
+    };
+
+    const SearchContext = struct {
+        thread_id: std.Thread.Id,
+        visited: []u32,
+        candidates: []SearchItem,
+        w: []SearchItem,
+        mark: u32,
+    };
+
     allocator: mem.Allocator,
     nodes: std.ArrayList(Node),
     /// Single pool for all edges to avoid allocator churn
@@ -633,6 +713,9 @@ const HNSWIndex = struct {
     scratch_candidates: []SearchItem,
     scratch_w: []SearchItem,
     scratch_mark: u32,
+    search_contexts: std.ArrayList(*SearchContext),
+    search_contexts_lock: std.Thread.Mutex,
+    build_rwlock: std.Thread.RwLock,
     entry_point: ?usize,
     m: usize, // Max connections per layer
     ef_construction: usize,
@@ -654,6 +737,9 @@ const HNSWIndex = struct {
             .scratch_candidates = &[_]SearchItem{},
             .scratch_w = &[_]SearchItem{},
             .scratch_mark = 1,
+            .search_contexts = std.ArrayList(*SearchContext).init(allocator),
+            .search_contexts_lock = .{},
+            .build_rwlock = .{},
             .entry_point = null,
             .m = m,
             .ef_construction = ef_construction,
@@ -675,6 +761,13 @@ const HNSWIndex = struct {
         if (self.scratch_visited.len > 0) self.allocator.free(self.scratch_visited);
         if (self.scratch_candidates.len > 0) self.allocator.free(self.scratch_candidates);
         if (self.scratch_w.len > 0) self.allocator.free(self.scratch_w);
+        for (self.search_contexts.items) |ctx| {
+            if (ctx.visited.len > 0) self.allocator.free(ctx.visited);
+            if (ctx.candidates.len > 0) self.allocator.free(ctx.candidates);
+            if (ctx.w.len > 0) self.allocator.free(ctx.w);
+            self.allocator.destroy(ctx);
+        }
+        self.search_contexts.deinit();
     }
 
     fn ensureBuffer(comptime T: type, allocator: mem.Allocator, buf: *[]T, needed: usize) !void {
@@ -708,6 +801,52 @@ const HNSWIndex = struct {
         } else {
             self.scratch_mark += 1;
         }
+    }
+
+    fn ensureSearchContextCapacity(
+        self: *HNSWIndex,
+        ctx: *SearchContext,
+        num_closest: usize,
+        max_nodes: usize,
+    ) !void {
+        const candidate_cap = @max(num_closest * 16, 16);
+        const w_cap = @max(num_closest, 1);
+
+        try ensureBuffer(u32, self.allocator, &ctx.visited, max_nodes);
+        try ensureBuffer(SearchItem, self.allocator, &ctx.candidates, candidate_cap);
+        try ensureBuffer(SearchItem, self.allocator, &ctx.w, w_cap);
+
+        if (ctx.mark == std.math.maxInt(u32)) {
+            @memset(ctx.visited, 0);
+            ctx.mark = 1;
+        } else {
+            ctx.mark += 1;
+        }
+    }
+
+    fn acquireSearchContext(self: *HNSWIndex, num_closest: usize, max_nodes: usize) !*SearchContext {
+        self.search_contexts_lock.lock();
+        defer self.search_contexts_lock.unlock();
+
+        const thread_id = std.Thread.getCurrentId();
+        for (self.search_contexts.items) |ctx| {
+            if (ctx.thread_id == thread_id) {
+                try self.ensureSearchContextCapacity(ctx, num_closest, max_nodes);
+                return ctx;
+            }
+        }
+
+        const ctx = try self.allocator.create(SearchContext);
+        ctx.* = .{
+            .thread_id = thread_id,
+            .visited = &[_]u32{},
+            .candidates = &[_]SearchItem{},
+            .w = &[_]SearchItem{},
+            .mark = 1,
+        };
+        try self.search_contexts.append(ctx);
+        try self.ensureSearchContextCapacity(ctx, num_closest, max_nodes);
+        return ctx;
     }
 
     /// Pre-allocate edge pool capacity for bulk insertions
@@ -868,46 +1007,79 @@ const HNSWIndex = struct {
     }
 
     pub fn insert(self: *HNSWIndex, idx: usize, storage: *const VectorStorage) !void {
-        const level = self.selectLevel();
-        const node = try Node.init(self.allocator, level);
+        try self.insertParallel(idx, storage);
+    }
 
-        // Ensure we have enough nodes
-        while (self.nodes.items.len <= idx) {
-            try self.nodes.append(try Node.init(self.allocator, 0));
-        }
-        self.nodes.items[idx].deinit(self.allocator);
-        self.nodes.items[idx] = node;
+    pub fn insertParallel(self: *HNSWIndex, idx: usize, storage: *const VectorStorage) !void {
+        var level: u8 = 0;
+        var old_entry: usize = 0;
+        var entry_level: u8 = 0;
 
-        if (self.entry_point == null) {
-            self.entry_point = idx;
-            self.max_level = level;
-            return;
-        }
+        {
+            self.build_rwlock.lock();
+            errdefer self.build_rwlock.unlock();
 
-        const vector = storage.getVector(idx);
-        const old_entry = self.entry_point.?;
-        const entry_level = self.nodes.items[old_entry].level;
-        var current_entry = old_entry;
+            level = self.selectLevel();
+            const node = try Node.init(self.allocator, level);
 
-        // Search from top layer to target layer.
-        if (entry_level > 0) {
-            var l = @min(level, entry_level);
-            while (l > 0) : (l -= 1) {
-                const nearest_at_level = try self.searchLayerInsert(vector, current_entry, self.ef_construction, l, storage);
-                std.debug.assert(nearest_at_level.len > 0);
-                current_entry = nearest_at_level[0].idx;
+            // Ensure we have enough nodes.
+            while (self.nodes.items.len <= idx) {
+                try self.nodes.append(try Node.init(self.allocator, 0));
             }
+            self.nodes.items[idx].deinit(self.allocator);
+            self.nodes.items[idx] = node;
+
+            if (self.entry_point == null) {
+                self.entry_point = idx;
+                self.max_level = level;
+                self.build_rwlock.unlock();
+                return;
+            }
+
+            old_entry = self.entry_point.?;
+            entry_level = self.nodes.items[old_entry].level;
+            self.build_rwlock.unlock();
         }
 
-        const nearest = try self.searchLayerInsert(vector, current_entry, self.ef_construction, 0, storage);
-        std.debug.assert(nearest.len > 0);
+        var nearest_copy: []SearchItem = &[_]SearchItem{};
+        defer if (nearest_copy.len > 0) self.allocator.free(nearest_copy);
+
+        // Search phase can run concurrently across threads.
+        {
+            self.build_rwlock.lockShared();
+            errdefer self.build_rwlock.unlockShared();
+
+            const vector = storage.getVector(idx);
+            var current_entry = old_entry;
+
+            // Search from top layer to target layer.
+            if (entry_level > 0) {
+                var l = @min(level, entry_level);
+                while (l > 0) : (l -= 1) {
+                    const nearest_at_level = try self.searchLayerInsert(vector, current_entry, self.ef_construction, l, storage);
+                    std.debug.assert(nearest_at_level.len > 0);
+                    current_entry = nearest_at_level[0].idx;
+                }
+            }
+
+            const nearest = try self.searchLayerInsert(vector, current_entry, self.ef_construction, 0, storage);
+            std.debug.assert(nearest.len > 0);
+            nearest_copy = try self.allocator.alloc(SearchItem, nearest.len);
+            @memcpy(nearest_copy, nearest);
+
+            self.build_rwlock.unlockShared();
+        }
+
+        // Link phase is serialized for structural safety.
+        self.build_rwlock.lock();
+        defer self.build_rwlock.unlock();
 
         // Connect the new node.
         var l: usize = 0;
         while (l <= level) : (l += 1) {
             const m = if (l == 0) self.m * 2 else self.m;
-            const candidate_count = @min(m, nearest.len);
-            for (nearest[0..candidate_count]) |item| {
+            const candidate_count = @min(m, nearest_copy.len);
+            for (nearest_copy[0..candidate_count]) |item| {
                 const neighbor = item.idx;
                 if (l > self.nodes.items[neighbor].level) continue;
                 const dist = item.distance;
@@ -916,7 +1088,8 @@ const HNSWIndex = struct {
             }
         }
 
-        if (level > entry_level) {
+        const current_entry_level = self.nodes.items[self.entry_point.?].level;
+        if (level > current_entry_level) {
             self.entry_point = idx;
             self.max_level = level;
         }
@@ -931,11 +1104,11 @@ const HNSWIndex = struct {
         storage: *const VectorStorage,
     ) ![]SearchItem {
         const ef = @max(num_closest, 1);
-        try self.ensureInsertScratch(ef);
-
-        const mark = self.scratch_mark;
-        const candidates_items = self.scratch_candidates;
-        const w_items = self.scratch_w;
+        const ctx = try self.acquireSearchContext(ef, self.nodes.items.len);
+        const mark = ctx.mark;
+        const visited = ctx.visited;
+        const candidates_items = ctx.candidates;
+        const w_items = ctx.w;
         var candidates_len: usize = 0;
         var w_len: usize = 0;
 
@@ -944,7 +1117,7 @@ const HNSWIndex = struct {
         candidates_len = 1;
         w_items[0] = .{ .idx = entry, .distance = entry_dist };
         w_len = 1;
-        self.scratch_visited[entry] = mark;
+        visited[entry] = mark;
 
         var current_idx: usize = 0;
         while (current_idx < candidates_len) {
@@ -955,8 +1128,8 @@ const HNSWIndex = struct {
             const connections = self.getConnections(current.idx, layer);
 
             for (connections) |neighbor| {
-                if (self.scratch_visited[neighbor] == mark) continue;
-                self.scratch_visited[neighbor] = mark;
+                if (visited[neighbor] == mark) continue;
+                visited[neighbor] = mark;
 
                 const dist = VectorOps.cosineDistanceFast(query, storage.getVector(neighbor));
 
@@ -1018,19 +1191,13 @@ const HNSWIndex = struct {
         layer: usize,
         storage: *const VectorStorage,
     ) !std.ArrayList(usize) {
-        // Use a bitset for visited tracking - much faster than hashmap
-        const max_nodes = self.nodes.items.len;
-        const BitSet = std.DynamicBitSetUnmanaged;
-        var visited = try BitSet.initEmpty(self.allocator, max_nodes);
-        defer visited.deinit(self.allocator);
-
-        // Pre-allocate arrays to avoid allocation in hot loop
-        var candidates_items = try self.allocator.alloc(SearchItem, num_closest * 16);
-        defer self.allocator.free(candidates_items);
+        const ef = @max(num_closest, 1);
+        const ctx = try self.acquireSearchContext(ef, self.nodes.items.len);
+        const visited = ctx.visited;
+        const mark = ctx.mark;
+        const candidates_items = ctx.candidates;
+        const w_items = ctx.w;
         var candidates_len: usize = 0;
-
-        var w_items = try self.allocator.alloc(SearchItem, num_closest);
-        defer self.allocator.free(w_items);
         var w_len: usize = 0;
 
         const entry_dist = VectorOps.cosineDistanceFast(query, storage.getVector(entry));
@@ -1038,7 +1205,7 @@ const HNSWIndex = struct {
         candidates_len = 1;
         w_items[0] = .{ .idx = entry, .distance = entry_dist };
         w_len = 1;
-        visited.set(entry);
+        visited[entry] = mark;
 
         // Prefetch the entry node's connections
         const entry_node = &self.nodes.items[entry];
@@ -1075,8 +1242,8 @@ const HNSWIndex = struct {
             }
 
             for (connections, distances) |neighbor, _| {
-                if (visited.isSet(neighbor)) continue;
-                visited.set(neighbor);
+                if (visited[neighbor] == mark) continue;
+                visited[neighbor] = mark;
 
                 // Skip distance pruning - it kills recall
                 // const dist_lower_bound = @abs(current.distance - cached_dist);
@@ -1221,11 +1388,6 @@ const HNSWIndex = struct {
             return result;
         }
     }
-
-    const SearchItem = struct {
-        idx: usize,
-        distance: f32,
-    };
 
     // Comparator for max-heap (worst candidates at top)
     fn compareSearchItemsReverse(context: void, a: SearchItem, b: SearchItem) std.math.Order {
@@ -1646,6 +1808,8 @@ pub const VectorDB = struct {
         }
 
         const ef = @max(k * 8, self.search_ef);
+        self.index.build_rwlock.lockShared();
+        defer self.index.build_rwlock.unlockShared();
         const candidates = try self.index.searchLayer(normalized_query, self.index.entry_point.?, ef, 0, &self.storage);
         defer candidates.deinit();
 
@@ -1849,10 +2013,12 @@ pub const VectorDB = struct {
             std.math.clamp(@max(self.search_ef, k * 16), k, self.storage.count)
         else
             0;
-        var hnsw_assist = if (hnsw_assist_ef > 0 and self.index.entry_point != null)
-            try self.index.searchLayer(normalized_query, self.index.entry_point.?, hnsw_assist_ef, 0, &self.storage)
-        else
-            std.ArrayList(usize).init(self.allocator);
+        var hnsw_assist = std.ArrayList(usize).init(self.allocator);
+        if (hnsw_assist_ef > 0 and self.index.entry_point != null) {
+            self.index.build_rwlock.lockShared();
+            defer self.index.build_rwlock.unlockShared();
+            hnsw_assist = try self.index.searchLayer(normalized_query, self.index.entry_point.?, hnsw_assist_ef, 0, &self.storage);
+        }
         defer hnsw_assist.deinit();
 
         const candidate_cap = total_candidates + hnsw_assist.items.len;
@@ -1860,23 +2026,23 @@ pub const VectorDB = struct {
         defer self.allocator.free(candidate_ids);
         var candidate_len: usize = 0;
 
-        const BitSet = std.DynamicBitSetUnmanaged;
-        var seen = try BitSet.initEmpty(self.allocator, self.storage.count);
-        defer seen.deinit(self.allocator);
+        const dedupe_ctx = try self.index.acquireSearchContext(1, self.storage.count);
+        const seen = dedupe_ctx.visited;
+        const seen_mark = dedupe_ctx.mark;
 
         for (0..thread_count) |i| {
             const local = local_buffers[i][0..local_lens[i]];
             for (local) |cand| {
-                if (seen.isSet(cand.idx)) continue;
-                seen.set(cand.idx);
+                if (seen[cand.idx] == seen_mark) continue;
+                seen[cand.idx] = seen_mark;
                 candidate_ids[candidate_len] = cand.idx;
                 candidate_len += 1;
             }
         }
 
         for (hnsw_assist.items) |idx| {
-            if (seen.isSet(idx)) continue;
-            seen.set(idx);
+            if (seen[idx] == seen_mark) continue;
+            seen[idx] = seen_mark;
             candidate_ids[candidate_len] = idx;
             candidate_len += 1;
         }
@@ -1949,13 +2115,50 @@ pub const VectorDB = struct {
             if (vector.len != self.storage.dimension) return error.InvalidDimension;
         }
 
-        // Fill storage in parallel, then build the graph sequentially.
+        // Fill storage in parallel, then build the graph with concurrent search phases.
         const start_idx = try self.storage.appendBatchNormalized(vectors);
         try self.index.reserveCapacity(vectors.len);
 
-        var i: usize = 0;
-        while (i < vectors.len) : (i += 1) {
-            try self.index.insert(start_idx + i, &self.storage);
+        const thread_count = @max(1, @min(std.Thread.getCpuCount() catch 1, vectors.len));
+        if (thread_count > 1 and vectors.len >= thread_count * 128) {
+            const threads = try self.allocator.alloc(std.Thread, thread_count);
+            defer self.allocator.free(threads);
+
+            const Context = struct {
+                db: *VectorDB,
+                start_idx: usize,
+                start: usize,
+                end: usize,
+
+                fn run(ctx: @This()) void {
+                    var i = ctx.start;
+                    while (i < ctx.end) : (i += 1) {
+                        ctx.db.index.insertParallel(ctx.start_idx + i, &ctx.db.storage) catch |err| {
+                            @panic(@errorName(err));
+                        };
+                    }
+                }
+            };
+
+            const chunk_size = (vectors.len + thread_count - 1) / thread_count;
+            for (threads, 0..) |*thread, i| {
+                const start = i * chunk_size;
+                const end = @min(start + chunk_size, vectors.len);
+                const ctx = Context{
+                    .db = self,
+                    .start_idx = start_idx,
+                    .start = start,
+                    .end = end,
+                };
+                thread.* = try std.Thread.spawn(.{}, Context.run, .{ctx});
+            }
+
+            for (threads) |thread| thread.join();
+        } else {
+            var i: usize = 0;
+            while (i < vectors.len) : (i += 1) {
+                try self.index.insert(start_idx + i, &self.storage);
+            }
         }
 
         self.turbo_dirty = true;
@@ -2031,8 +2234,16 @@ pub const VectorDB = struct {
         try file.writer().writeInt(u32, @intCast(self.storage.count), .little);
 
         // Write vectors
-        const data_size = self.storage.count * self.storage.dimension * @sizeOf(f32);
-        try file.writeAll(self.storage.data[0..data_size]);
+        if (self.storage.use_slabs) {
+            var i: usize = 0;
+            while (i < self.storage.count) : (i += 1) {
+                const vec = self.storage.getVector(i);
+                try file.writeAll(mem.sliceAsBytes(vec));
+            }
+        } else {
+            const data_size = self.storage.count * self.storage.dimension * @sizeOf(f32);
+            try file.writeAll(self.storage.data[0..data_size]);
+        }
 
         // Write index structure
         // ... (implement index serialization)
