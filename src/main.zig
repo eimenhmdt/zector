@@ -623,8 +623,12 @@ const HNSWIndex = struct {
     /// Pre-allocated edge slabs per level to avoid growth during bulk insert
     level_cursors: []usize,
     max_level: u8,
-    /// Re-usable scratch vectors (grow-once arena)
+    /// Re-usable scratch buffers for insertion-time graph search
     scratch_idx: []usize,
+    scratch_visited: []u32,
+    scratch_candidates: []SearchItem,
+    scratch_w: []SearchItem,
+    scratch_mark: u32,
     entry_point: ?usize,
     m: usize, // Max connections per layer
     ef_construction: usize,
@@ -642,6 +646,10 @@ const HNSWIndex = struct {
             .level_cursors = &[_]usize{},
             .max_level = 0,
             .scratch_idx = &[_]usize{},
+            .scratch_visited = &[_]u32{},
+            .scratch_candidates = &[_]SearchItem{},
+            .scratch_w = &[_]SearchItem{},
+            .scratch_mark = 1,
             .entry_point = null,
             .m = m,
             .ef_construction = ef_construction,
@@ -660,6 +668,42 @@ const HNSWIndex = struct {
         self.distance_pool.deinit();
         if (self.level_cursors.len > 0) self.allocator.free(self.level_cursors);
         if (self.scratch_idx.len > 0) self.allocator.free(self.scratch_idx);
+        if (self.scratch_visited.len > 0) self.allocator.free(self.scratch_visited);
+        if (self.scratch_candidates.len > 0) self.allocator.free(self.scratch_candidates);
+        if (self.scratch_w.len > 0) self.allocator.free(self.scratch_w);
+    }
+
+    fn ensureBuffer(comptime T: type, allocator: mem.Allocator, buf: *[]T, needed: usize) !void {
+        if (buf.*.len >= needed) return;
+
+        var new_cap = @max(needed, 64);
+        if (buf.*.len > 0) {
+            new_cap = @max(new_cap, buf.*.len * 2);
+        }
+
+        const new_buf = try allocator.alloc(T, new_cap);
+        if (buf.*.len > 0) {
+            @memcpy(new_buf[0..buf.*.len], buf.*);
+            allocator.free(buf.*);
+        }
+        buf.* = new_buf;
+    }
+
+    fn ensureInsertScratch(self: *HNSWIndex, num_closest: usize) !void {
+        const candidate_cap = @max(num_closest * 16, 16);
+        const w_cap = @max(num_closest, 1);
+
+        try ensureBuffer(u32, self.allocator, &self.scratch_visited, self.nodes.items.len);
+        try ensureBuffer(SearchItem, self.allocator, &self.scratch_candidates, candidate_cap);
+        try ensureBuffer(SearchItem, self.allocator, &self.scratch_w, w_cap);
+        try ensureBuffer(usize, self.allocator, &self.scratch_idx, w_cap);
+
+        if (self.scratch_mark == std.math.maxInt(u32)) {
+            @memset(self.scratch_visited, 0);
+            self.scratch_mark = 1;
+        } else {
+            self.scratch_mark += 1;
+        }
     }
 
     /// Pre-allocate edge pool capacity for bulk insertions
@@ -780,6 +824,7 @@ const HNSWIndex = struct {
         var insert_pos: usize = conn.len; // default: append at end
         var i_iter: usize = 0;
         while (i_iter < conn.len) : (i_iter += 1) {
+            if (self.edge_pool.items[offset + i_iter] == neighbor_idx) return;
             const other_dist = self.distance_pool.items[offset + i_iter];
             if (dist < other_dist) {
                 insert_pos = i_iter;
@@ -831,48 +876,134 @@ const HNSWIndex = struct {
 
         if (self.entry_point == null) {
             self.entry_point = idx;
+            self.max_level = level;
             return;
         }
 
         const vector = storage.getVector(idx);
-        var nearest = try self.searchLayer(vector, self.entry_point.?, 1, 0, storage);
-        defer {
-            for (nearest.items) |_| {}
-            nearest.deinit();
-        }
+        const old_entry = self.entry_point.?;
+        const entry_level = self.nodes.items[old_entry].level;
+        var current_entry = old_entry;
 
-        // Search from top layer to target layer
-        const entry_level = self.nodes.items[self.entry_point.?].level;
+        // Search from top layer to target layer.
         if (entry_level > 0) {
             var l = @min(level, entry_level);
             while (l > 0) : (l -= 1) {
-                const new_nearest = try self.searchLayer(vector, nearest.items[0], self.ef_construction, l, storage);
-                nearest.deinit();
-                nearest = new_nearest;
+                const nearest_at_level = try self.searchLayerInsert(vector, current_entry, self.ef_construction, l, storage);
+                std.debug.assert(nearest_at_level.len > 0);
+                current_entry = nearest_at_level[0].idx;
             }
         }
 
-        // Search at level 0 with higher ef_construction for better quality
-        const level0_nearest = try self.searchLayer(vector, nearest.items[0], self.ef_construction, 0, storage);
-        nearest.deinit();
-        nearest = level0_nearest;
+        const nearest = try self.searchLayerInsert(vector, current_entry, self.ef_construction, 0, storage);
+        std.debug.assert(nearest.len > 0);
 
-        // Connect the new node
+        // Connect the new node.
         var l: usize = 0;
         while (l <= level) : (l += 1) {
             const m = if (l == 0) self.m * 2 else self.m;
-            const candidates = try self.topK(nearest.items, m, vector, storage);
-            defer self.allocator.free(candidates);
-
-            for (candidates) |neighbor| {
-                const dist = VectorOps.cosineDistanceFast(vector, storage.getVector(neighbor));
+            const candidate_count = @min(m, nearest.len);
+            for (nearest[0..candidate_count]) |item| {
+                const neighbor = item.idx;
+                if (l > self.nodes.items[neighbor].level) continue;
+                const dist = item.distance;
                 try self.addConnection(idx, neighbor, l, dist, storage);
-                // Only add reverse connection if neighbor has this level
-                if (l <= self.nodes.items[neighbor].level) {
-                    try self.addConnection(neighbor, idx, l, dist, storage); // symmetric distance
+                try self.addConnection(neighbor, idx, l, dist, storage);
+            }
+        }
+
+        if (level > entry_level) {
+            self.entry_point = idx;
+            self.max_level = level;
+        }
+    }
+
+    fn searchLayerInsert(
+        self: *HNSWIndex,
+        query: []const f32,
+        entry: usize,
+        num_closest: usize,
+        layer: usize,
+        storage: *const VectorStorage,
+    ) ![]SearchItem {
+        const ef = @max(num_closest, 1);
+        try self.ensureInsertScratch(ef);
+
+        const mark = self.scratch_mark;
+        const candidates_items = self.scratch_candidates;
+        const w_items = self.scratch_w;
+        var candidates_len: usize = 0;
+        var w_len: usize = 0;
+
+        const entry_dist = VectorOps.cosineDistanceFast(query, storage.getVector(entry));
+        candidates_items[0] = .{ .idx = entry, .distance = entry_dist };
+        candidates_len = 1;
+        w_items[0] = .{ .idx = entry, .distance = entry_dist };
+        w_len = 1;
+        self.scratch_visited[entry] = mark;
+
+        var current_idx: usize = 0;
+        while (current_idx < candidates_len) {
+            const current = candidates_items[current_idx];
+            current_idx += 1;
+
+            if (layer > self.nodes.items[current.idx].level) continue;
+            const connections = self.getConnections(current.idx, layer);
+
+            for (connections) |neighbor| {
+                if (self.scratch_visited[neighbor] == mark) continue;
+                self.scratch_visited[neighbor] = mark;
+
+                const dist = VectorOps.cosineDistanceFast(query, storage.getVector(neighbor));
+
+                if (candidates_len < candidates_items.len) {
+                    candidates_items[candidates_len] = .{ .idx = neighbor, .distance = dist };
+                    candidates_len += 1;
+                }
+
+                if (w_len < ef) {
+                    w_items[w_len] = .{ .idx = neighbor, .distance = dist };
+                    w_len += 1;
+
+                    var child = w_len - 1;
+                    while (child > 0) {
+                        const parent = (child - 1) / 2;
+                        if (w_items[child].distance <= w_items[parent].distance) break;
+                        std.mem.swap(SearchItem, &w_items[child], &w_items[parent]);
+                        child = parent;
+                    }
+                } else if (dist < w_items[0].distance) {
+                    w_items[0] = .{ .idx = neighbor, .distance = dist };
+
+                    var parent: usize = 0;
+                    while (true) {
+                        const left = 2 * parent + 1;
+                        const right = 2 * parent + 2;
+                        var largest = parent;
+
+                        if (left < w_len and w_items[left].distance > w_items[largest].distance) {
+                            largest = left;
+                        }
+                        if (right < w_len and w_items[right].distance > w_items[largest].distance) {
+                            largest = right;
+                        }
+
+                        if (largest == parent) break;
+                        std.mem.swap(SearchItem, &w_items[parent], &w_items[largest]);
+                        parent = largest;
+                    }
                 }
             }
         }
+
+        std.sort.heap(SearchItem, w_items[0..w_len], {}, struct {
+            fn lessThan(context: void, a: SearchItem, b: SearchItem) bool {
+                _ = context;
+                return a.distance < b.distance;
+            }
+        }.lessThan);
+
+        return w_items[0..w_len];
     }
 
     fn searchLayer(
