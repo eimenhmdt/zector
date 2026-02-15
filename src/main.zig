@@ -14,6 +14,10 @@ const PAGE_ALIGNMENT = 16384; // Common page size on macOS
 const PREFETCH_DISTANCE = 256; // Prefetch distance for memory access
 const CACHE_LINE_SIZE = 64;
 const BRUTE_FORCE_THRESHOLD = 4096;
+const IVF_MIN_VECTORS_DEFAULT = 8192;
+const IVF_MIN_LISTS = 16;
+const IVF_MAX_LISTS = 512;
+const IVF_DEFAULT_PROBES = 8;
 
 // Vector operations using SIMD when available
 const VectorOps = struct {
@@ -1239,12 +1243,35 @@ const HNSWIndex = struct {
 pub const VectorDB = struct {
     const FILE_MAGIC: u32 = 0x5A454354; // "ZECT"
     const FILE_VERSION: u32 = 1;
+    const INT8_SCALE: f32 = 127.0;
+    const INT8_INV_SCALE_SQ: f32 = 1.0 / (INT8_SCALE * INT8_SCALE);
+
+    const ApproxCandidate = struct {
+        idx: usize,
+        approx_distance: f32,
+    };
 
     allocator: mem.Allocator,
     storage: VectorStorage,
     index: HNSWIndex,
     metadata: std.AutoHashMap(usize, std.json.Value),
     search_ef: usize,
+    turbo_enabled: bool,
+    turbo_dirty: bool,
+    ivf_min_vectors: usize,
+    ivf_nlist: usize,
+    ivf_probes: usize,
+    ivf_rerank_factor: usize,
+    ivf_centroids: []f32,
+    ivf_offsets: []usize,
+    ivf_lengths: []usize,
+    ivf_postings: []usize,
+    ivf_postings_mmap: ?[]align(PAGE_ALIGNMENT) u8,
+    ivf_postings_file: ?fs.File,
+    ivf_postings_path: ?[]u8,
+    ivf_postings_is_mmap: bool,
+    quantized_vectors: []i8,
+    storage_file_path: ?[]u8,
 
     pub fn init(
         allocator: mem.Allocator,
@@ -1254,6 +1281,11 @@ pub const VectorDB = struct {
             index_m: usize = 32, // Increased for better connectivity
             index_ef_construction: usize = 400, // Increased for better quality
             file_path: ?[]const u8 = null,
+            enable_turbo: bool = true,
+            ivf_min_vectors: usize = IVF_MIN_VECTORS_DEFAULT,
+            ivf_nlist: usize = 0, // 0 => auto
+            ivf_probes: usize = IVF_DEFAULT_PROBES,
+            ivf_rerank_factor: usize = 8,
         },
     ) !VectorDB {
         const storage = if (options.file_path) |path|
@@ -1261,19 +1293,280 @@ pub const VectorDB = struct {
         else
             try VectorStorage.init(allocator, dimension, options.initial_capacity);
 
+        const storage_file_path = if (options.file_path) |path|
+            try allocator.dupe(u8, path)
+        else
+            null;
+
         return VectorDB{
             .allocator = allocator,
             .storage = storage,
             .index = HNSWIndex.init(allocator, options.index_m, options.index_ef_construction),
             .metadata = std.AutoHashMap(usize, std.json.Value).init(allocator),
             .search_ef = 128,
+            .turbo_enabled = options.enable_turbo,
+            .turbo_dirty = true,
+            .ivf_min_vectors = options.ivf_min_vectors,
+            .ivf_nlist = options.ivf_nlist,
+            .ivf_probes = @max(options.ivf_probes, 1),
+            .ivf_rerank_factor = @max(options.ivf_rerank_factor, 1),
+            .ivf_centroids = &[_]f32{},
+            .ivf_offsets = &[_]usize{},
+            .ivf_lengths = &[_]usize{},
+            .ivf_postings = &[_]usize{},
+            .ivf_postings_mmap = null,
+            .ivf_postings_file = null,
+            .ivf_postings_path = null,
+            .ivf_postings_is_mmap = false,
+            .quantized_vectors = &[_]i8{},
+            .storage_file_path = storage_file_path,
         };
     }
 
     pub fn deinit(self: *VectorDB) void {
+        self.releaseIvfPostings();
+        if (self.ivf_centroids.len > 0) self.allocator.free(self.ivf_centroids);
+        if (self.ivf_offsets.len > 0) self.allocator.free(self.ivf_offsets);
+        if (self.ivf_lengths.len > 0) self.allocator.free(self.ivf_lengths);
+        if (self.quantized_vectors.len > 0) self.allocator.free(self.quantized_vectors);
+        if (self.storage_file_path) |path| self.allocator.free(path);
         self.storage.deinit();
         self.index.deinit();
         self.metadata.deinit();
+    }
+
+    fn releaseIvfPostings(self: *VectorDB) void {
+        if (self.ivf_postings_is_mmap) {
+            if (self.ivf_postings_mmap) |mmap_bytes| {
+                std.posix.munmap(mmap_bytes);
+            }
+            self.ivf_postings_mmap = null;
+        } else if (self.ivf_postings.len > 0) {
+            self.allocator.free(self.ivf_postings);
+        }
+
+        if (self.ivf_postings_file) |file| {
+            file.close();
+            self.ivf_postings_file = null;
+        }
+
+        if (self.ivf_postings_path) |path| {
+            self.allocator.free(path);
+            self.ivf_postings_path = null;
+        }
+
+        self.ivf_postings = &[_]usize{};
+        self.ivf_postings_is_mmap = false;
+    }
+
+    fn allocateIvfPostings(self: *VectorDB, total: usize) !void {
+        self.releaseIvfPostings();
+        if (total == 0) return;
+
+        const bytes = total * @sizeOf(usize);
+        if (self.storage_file_path != null) {
+            const base_path = self.storage_file_path.?;
+            const path = try std.fmt.allocPrint(self.allocator, "{s}.ivf.postings", .{base_path});
+            errdefer self.allocator.free(path);
+
+            const file = try fs.cwd().createFile(path, .{
+                .read = true,
+                .truncate = true,
+            });
+            errdefer file.close();
+
+            try file.setEndPos(bytes);
+
+            const mmap_bytes = try std.posix.mmap(
+                null,
+                bytes,
+                std.posix.PROT.READ | std.posix.PROT.WRITE,
+                std.posix.MAP{ .TYPE = .SHARED },
+                file.handle,
+                0,
+            );
+            errdefer std.posix.munmap(mmap_bytes);
+
+            self.ivf_postings_path = path;
+            self.ivf_postings_file = file;
+            self.ivf_postings_mmap = mmap_bytes;
+            self.ivf_postings_is_mmap = true;
+            self.ivf_postings = @as([*]usize, @ptrCast(@alignCast(mmap_bytes.ptr)))[0..total];
+            return;
+        }
+
+        self.ivf_postings = try self.allocator.alloc(usize, total);
+        self.ivf_postings_is_mmap = false;
+    }
+
+    fn quantizeValue(v: f32) i8 {
+        const scaled = std.math.clamp(v * INT8_SCALE, -INT8_SCALE, INT8_SCALE);
+        return @as(i8, @intFromFloat(@round(scaled)));
+    }
+
+    fn centroidSlice(self: *const VectorDB, centroid_idx: usize) []const f32 {
+        const dim = self.storage.dimension;
+        const offset = centroid_idx * dim;
+        return self.ivf_centroids[offset .. offset + dim];
+    }
+
+    fn nearestCentroid(self: *const VectorDB, vector: []const f32) usize {
+        var best_idx: usize = 0;
+        var best_dist: f32 = math.inf(f32);
+
+        var c: usize = 0;
+        while (c < self.ivf_offsets.len) : (c += 1) {
+            const dist = VectorOps.cosineDistanceFast(vector, self.centroidSlice(c));
+            if (dist < best_dist) {
+                best_dist = dist;
+                best_idx = c;
+            }
+        }
+
+        return best_idx;
+    }
+
+    fn rebuildTurboIndex(self: *VectorDB) !void {
+        if (!self.turbo_enabled) {
+            self.turbo_dirty = false;
+            return;
+        }
+
+        const count = self.storage.count;
+        const dim = self.storage.dimension;
+        if (count < self.ivf_min_vectors) {
+            self.releaseIvfPostings();
+            if (self.ivf_centroids.len > 0) {
+                self.allocator.free(self.ivf_centroids);
+                self.ivf_centroids = &[_]f32{};
+            }
+            if (self.ivf_offsets.len > 0) {
+                self.allocator.free(self.ivf_offsets);
+                self.ivf_offsets = &[_]usize{};
+            }
+            if (self.ivf_lengths.len > 0) {
+                self.allocator.free(self.ivf_lengths);
+                self.ivf_lengths = &[_]usize{};
+            }
+            if (self.quantized_vectors.len > 0) {
+                self.allocator.free(self.quantized_vectors);
+                self.quantized_vectors = &[_]i8{};
+            }
+            self.turbo_dirty = false;
+            return;
+        }
+
+        const auto_nlist = std.math.clamp(
+            @as(usize, @intFromFloat(@sqrt(@as(f64, @floatFromInt(count))))),
+            IVF_MIN_LISTS,
+            IVF_MAX_LISTS,
+        );
+        const nlist = std.math.clamp(if (self.ivf_nlist == 0) auto_nlist else self.ivf_nlist, 1, count);
+        self.ivf_nlist = nlist;
+
+        const centroid_len = nlist * dim;
+        if (self.ivf_centroids.len != centroid_len) {
+            if (self.ivf_centroids.len > 0) self.allocator.free(self.ivf_centroids);
+            self.ivf_centroids = try self.allocator.alloc(f32, centroid_len);
+        }
+
+        if (self.ivf_offsets.len != nlist) {
+            if (self.ivf_offsets.len > 0) self.allocator.free(self.ivf_offsets);
+            self.ivf_offsets = try self.allocator.alloc(usize, nlist);
+        }
+
+        if (self.ivf_lengths.len != nlist) {
+            if (self.ivf_lengths.len > 0) self.allocator.free(self.ivf_lengths);
+            self.ivf_lengths = try self.allocator.alloc(usize, nlist);
+        }
+
+        // Initialize centroids from evenly spaced samples.
+        for (0..nlist) |c| {
+            const sample_idx = (c * count) / nlist;
+            const vec = self.storage.getVector(sample_idx);
+            @memcpy(self.ivf_centroids[c * dim ..][0..dim], vec);
+        }
+
+        // Small-kmeans refinement.
+        var sums = try self.allocator.alloc(f32, centroid_len);
+        defer self.allocator.free(sums);
+        var counts = try self.allocator.alloc(usize, nlist);
+        defer self.allocator.free(counts);
+
+        var iter: usize = 0;
+        while (iter < 2) : (iter += 1) {
+            @memset(sums, 0.0);
+            @memset(counts, 0);
+
+            var i: usize = 0;
+            while (i < count) : (i += 1) {
+                const vec = self.storage.getVector(i);
+                const c = self.nearestCentroid(vec);
+                counts[c] += 1;
+                const base = c * dim;
+                for (0..dim) |d| {
+                    sums[base + d] += vec[d];
+                }
+            }
+
+            for (0..nlist) |c| {
+                if (counts[c] == 0) continue;
+                const base = c * dim;
+                const inv = 1.0 / @as(f32, @floatFromInt(counts[c]));
+                for (0..dim) |d| {
+                    self.ivf_centroids[base + d] = sums[base + d] * inv;
+                }
+                VectorOps.normalize(self.ivf_centroids[base .. base + dim]);
+            }
+        }
+
+        // Build posting lists.
+        @memset(self.ivf_lengths, 0);
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            const vec = self.storage.getVector(i);
+            const c = self.nearestCentroid(vec);
+            self.ivf_lengths[c] += 1;
+        }
+
+        var running: usize = 0;
+        for (0..nlist) |c| {
+            self.ivf_offsets[c] = running;
+            running += self.ivf_lengths[c];
+        }
+
+        try self.allocateIvfPostings(count);
+
+        var cursors = try self.allocator.alloc(usize, nlist);
+        defer self.allocator.free(cursors);
+        @memcpy(cursors, self.ivf_offsets);
+
+        i = 0;
+        while (i < count) : (i += 1) {
+            const vec = self.storage.getVector(i);
+            const c = self.nearestCentroid(vec);
+            const write_pos = cursors[c];
+            self.ivf_postings[write_pos] = i;
+            cursors[c] += 1;
+        }
+
+        // Quantized copy for approximate scoring.
+        const quant_len = count * dim;
+        if (self.quantized_vectors.len != quant_len) {
+            if (self.quantized_vectors.len > 0) self.allocator.free(self.quantized_vectors);
+            self.quantized_vectors = try self.allocator.alloc(i8, quant_len);
+        }
+
+        i = 0;
+        while (i < count) : (i += 1) {
+            const vec = self.storage.getVector(i);
+            const dst = self.quantized_vectors[i * dim ..][0..dim];
+            for (vec, 0..) |v, d| {
+                dst[d] = quantizeValue(v);
+            }
+        }
+
+        self.turbo_dirty = false;
     }
 
     pub fn addVector(self: *VectorDB, vector: []const f32, metadata: ?std.json.Value) !usize {
@@ -1281,6 +1574,7 @@ pub const VectorDB = struct {
 
         const idx = try self.storage.addVector(vector);
         try self.index.insert(idx, &self.storage);
+        self.turbo_dirty = true;
 
         if (metadata) |m| {
             try self.metadata.put(idx, m);
@@ -1346,6 +1640,293 @@ pub const VectorDB = struct {
         return results;
     }
 
+    fn searchHnsw(self: *VectorDB, normalized_query: []const f32, k: usize) ![]SearchResult {
+        if (self.index.entry_point == null) {
+            return try self.allocator.alloc(SearchResult, 0);
+        }
+
+        const ef = @max(k * 8, self.search_ef);
+        const candidates = try self.index.searchLayer(normalized_query, self.index.entry_point.?, ef, 0, &self.storage);
+        defer candidates.deinit();
+
+        var results = try self.allocator.alloc(SearchResult, @min(k, candidates.items.len));
+        for (candidates.items[0..results.len], 0..) |idx, i| {
+            const vec = self.storage.getVector(idx);
+            if (i + 1 < results.len) {
+                const next_vec = self.storage.getVector(candidates.items[i + 1]);
+                @prefetch(next_vec.ptr, .{ .rw = .read, .locality = 2, .cache = .data });
+            }
+            results[i] = .{
+                .idx = idx,
+                .distance = VectorOps.cosineDistanceFast(normalized_query, vec),
+                .vector = vec,
+            };
+        }
+
+        return results;
+    }
+
+    fn searchTurbo(self: *VectorDB, normalized_query: []const f32, k: usize) ![]SearchResult {
+        if (self.turbo_dirty) try self.rebuildTurboIndex();
+        if (self.ivf_offsets.len == 0 or self.quantized_vectors.len == 0) {
+            return self.searchHnsw(normalized_query, k);
+        }
+
+        const ProbeCandidate = struct {
+            idx: usize,
+            distance: f32,
+        };
+
+        const nlist = self.ivf_offsets.len;
+        const probes = @min(self.ivf_probes, nlist);
+        if (probes == 0) return self.searchHnsw(normalized_query, k);
+
+        var probe_lists = try self.allocator.alloc(ProbeCandidate, probes);
+        defer self.allocator.free(probe_lists);
+        var probe_len: usize = 0;
+        var probe_worst_pos: usize = 0;
+        var probe_worst_dist: f32 = -std.math.inf(f32);
+
+        for (0..nlist) |c| {
+            const dist = VectorOps.cosineDistanceFast(normalized_query, self.centroidSlice(c));
+            if (probe_len < probes) {
+                probe_lists[probe_len] = .{ .idx = c, .distance = dist };
+                if (dist > probe_worst_dist) {
+                    probe_worst_dist = dist;
+                    probe_worst_pos = probe_len;
+                }
+                probe_len += 1;
+                continue;
+            }
+
+            if (dist >= probe_worst_dist) continue;
+            probe_lists[probe_worst_pos] = .{ .idx = c, .distance = dist };
+
+            probe_worst_pos = 0;
+            probe_worst_dist = probe_lists[0].distance;
+            var i: usize = 1;
+            while (i < probe_len) : (i += 1) {
+                if (probe_lists[i].distance > probe_worst_dist) {
+                    probe_worst_dist = probe_lists[i].distance;
+                    probe_worst_pos = i;
+                }
+            }
+        }
+
+        if (probe_len == 0) return self.searchHnsw(normalized_query, k);
+
+        std.sort.heap(ProbeCandidate, probe_lists[0..probe_len], {}, struct {
+            fn lessThan(context: void, a: ProbeCandidate, b: ProbeCandidate) bool {
+                _ = context;
+                return a.distance < b.distance;
+            }
+        }.lessThan);
+
+        var total_candidates: usize = 0;
+        for (probe_lists[0..probe_len]) |probe| {
+            total_candidates += self.ivf_lengths[probe.idx];
+        }
+        if (total_candidates == 0) return self.searchHnsw(normalized_query, k);
+
+        var query_q8_stack: [2048]i8 = undefined;
+        const query_q8 = if (normalized_query.len <= query_q8_stack.len)
+            query_q8_stack[0..normalized_query.len]
+        else
+            try self.allocator.alloc(i8, normalized_query.len);
+        defer if (normalized_query.len > query_q8_stack.len) self.allocator.free(query_q8);
+
+        for (normalized_query, 0..) |v, i| {
+            query_q8[i] = quantizeValue(v);
+        }
+
+        const local_cap = @min(total_candidates, @max(k * self.ivf_rerank_factor * 2, 64));
+        const thread_count = @max(1, @min(std.Thread.getCpuCount() catch 1, probe_len));
+
+        var local_buffers = try self.allocator.alloc([]ApproxCandidate, thread_count);
+        defer {
+            for (local_buffers) |buf| self.allocator.free(buf);
+            self.allocator.free(local_buffers);
+        }
+
+        var local_lens = try self.allocator.alloc(usize, thread_count);
+        defer self.allocator.free(local_lens);
+        @memset(local_lens, 0);
+
+        for (0..thread_count) |i| {
+            local_buffers[i] = try self.allocator.alloc(ApproxCandidate, local_cap);
+        }
+
+        const Context = struct {
+            db: *const VectorDB,
+            probes: []const ProbeCandidate,
+            query_q8: []const i8,
+            start: usize,
+            end: usize,
+            out: []ApproxCandidate,
+            out_len: *usize,
+
+            fn run(ctx: @This()) void {
+                var len: usize = 0;
+                var worst_pos: usize = 0;
+                var worst_dist: f32 = -std.math.inf(f32);
+                const dim = ctx.db.storage.dimension;
+
+                for (ctx.start..ctx.end) |probe_i| {
+                    const list_idx = ctx.probes[probe_i].idx;
+                    const offset = ctx.db.ivf_offsets[list_idx];
+                    const list_len = ctx.db.ivf_lengths[list_idx];
+
+                    var j: usize = 0;
+                    while (j < list_len) : (j += 1) {
+                        const idx = ctx.db.ivf_postings[offset + j];
+                        const qvec = ctx.db.quantized_vectors[idx * dim ..][0..dim];
+
+                        var dot_i32: i32 = 0;
+                        for (ctx.query_q8, qvec) |qv, vv| {
+                            dot_i32 += @as(i32, @intCast(qv)) * @as(i32, @intCast(vv));
+                        }
+
+                        const approx_dist = 1.0 - @as(f32, @floatFromInt(dot_i32)) * INT8_INV_SCALE_SQ;
+                        if (len < ctx.out.len) {
+                            ctx.out[len] = .{
+                                .idx = idx,
+                                .approx_distance = approx_dist,
+                            };
+                            if (approx_dist > worst_dist) {
+                                worst_dist = approx_dist;
+                                worst_pos = len;
+                            }
+                            len += 1;
+                            continue;
+                        }
+
+                        if (approx_dist >= worst_dist) continue;
+
+                        ctx.out[worst_pos] = .{
+                            .idx = idx,
+                            .approx_distance = approx_dist,
+                        };
+                        worst_pos = 0;
+                        worst_dist = ctx.out[0].approx_distance;
+                        var t: usize = 1;
+                        while (t < len) : (t += 1) {
+                            if (ctx.out[t].approx_distance > worst_dist) {
+                                worst_dist = ctx.out[t].approx_distance;
+                                worst_pos = t;
+                            }
+                        }
+                    }
+                }
+
+                ctx.out_len.* = len;
+            }
+        };
+
+        const chunk_size = (probe_len + thread_count - 1) / thread_count;
+        if (thread_count > 1 and probe_len > 1) {
+            const threads = try self.allocator.alloc(std.Thread, thread_count);
+            defer self.allocator.free(threads);
+
+            for (threads, 0..) |*thread, i| {
+                const start = i * chunk_size;
+                const end = @min(start + chunk_size, probe_len);
+                const ctx = Context{
+                    .db = self,
+                    .probes = probe_lists[0..probe_len],
+                    .query_q8 = query_q8,
+                    .start = start,
+                    .end = end,
+                    .out = local_buffers[i],
+                    .out_len = &local_lens[i],
+                };
+                thread.* = try std.Thread.spawn(.{}, Context.run, .{ctx});
+            }
+
+            for (threads) |thread| thread.join();
+        } else {
+            const ctx = Context{
+                .db = self,
+                .probes = probe_lists[0..probe_len],
+                .query_q8 = query_q8,
+                .start = 0,
+                .end = probe_len,
+                .out = local_buffers[0],
+                .out_len = &local_lens[0],
+            };
+            Context.run(ctx);
+        }
+
+        const merged_cap = @min(total_candidates, @max(k * self.ivf_rerank_factor * 4, 128));
+        var merged = try self.allocator.alloc(ApproxCandidate, merged_cap);
+        defer self.allocator.free(merged);
+        var merged_len: usize = 0;
+        var merged_worst_pos: usize = 0;
+        var merged_worst_dist: f32 = -std.math.inf(f32);
+
+        for (0..thread_count) |i| {
+            const local = local_buffers[i][0..local_lens[i]];
+            for (local) |cand| {
+                if (merged_len < merged_cap) {
+                    merged[merged_len] = cand;
+                    if (cand.approx_distance > merged_worst_dist) {
+                        merged_worst_dist = cand.approx_distance;
+                        merged_worst_pos = merged_len;
+                    }
+                    merged_len += 1;
+                    continue;
+                }
+
+                if (cand.approx_distance >= merged_worst_dist) continue;
+                merged[merged_worst_pos] = cand;
+
+                merged_worst_pos = 0;
+                merged_worst_dist = merged[0].approx_distance;
+                var t: usize = 1;
+                while (t < merged_len) : (t += 1) {
+                    if (merged[t].approx_distance > merged_worst_dist) {
+                        merged_worst_dist = merged[t].approx_distance;
+                        merged_worst_pos = t;
+                    }
+                }
+            }
+        }
+
+        if (merged_len == 0) return self.searchHnsw(normalized_query, k);
+
+        std.sort.heap(ApproxCandidate, merged[0..merged_len], {}, struct {
+            fn lessThan(context: void, a: ApproxCandidate, b: ApproxCandidate) bool {
+                _ = context;
+                return a.approx_distance < b.approx_distance;
+            }
+        }.lessThan);
+
+        const rerank_count = @min(merged_len, @max(k * self.ivf_rerank_factor, k));
+        var reranked = try self.allocator.alloc(SearchResult, rerank_count);
+        defer self.allocator.free(reranked);
+
+        for (0..rerank_count) |i| {
+            const idx = merged[i].idx;
+            const vec = self.storage.getVector(idx);
+            reranked[i] = .{
+                .idx = idx,
+                .distance = VectorOps.cosineDistanceFast(normalized_query, vec),
+                .vector = vec,
+            };
+        }
+
+        std.sort.heap(SearchResult, reranked, {}, struct {
+            fn lessThan(context: void, a: SearchResult, b: SearchResult) bool {
+                _ = context;
+                return a.distance < b.distance;
+            }
+        }.lessThan);
+
+        const out_len = @min(k, rerank_count);
+        const out = try self.allocator.alloc(SearchResult, out_len);
+        @memcpy(out, reranked[0..out_len]);
+        return out;
+    }
+
     pub fn search(self: *VectorDB, query: []const f32, k: usize) ![]SearchResult {
         if (query.len != self.storage.dimension) return error.InvalidDimension;
         if (k == 0 or self.storage.count == 0) {
@@ -1367,27 +1948,11 @@ pub const VectorDB = struct {
             return self.searchBruteForce(normalized_query, k);
         }
 
-        const ef = @max(k * 8, self.search_ef); // Much higher ef for perfect recall
-        const candidates = try self.index.searchLayer(normalized_query, self.index.entry_point.?, ef, 0, &self.storage);
-        defer candidates.deinit();
-
-        var results = try self.allocator.alloc(SearchResult, @min(k, candidates.items.len));
-
-        for (candidates.items[0..results.len], 0..) |idx, i| {
-            const vec = self.storage.getVector(idx);
-            if (i + 1 < results.len) {
-                const next_vec = self.storage.getVector(candidates.items[i + 1]);
-                @prefetch(next_vec.ptr, .{ .rw = .read, .locality = 2, .cache = .data });
-            }
-
-            results[i] = .{
-                .idx = idx,
-                .distance = VectorOps.cosineDistanceFast(normalized_query, vec),
-                .vector = vec,
-            };
+        if (self.turbo_enabled and self.storage.count >= self.ivf_min_vectors) {
+            return self.searchTurbo(normalized_query, k);
         }
 
-        return results;
+        return self.searchHnsw(normalized_query, k);
     }
 
     pub const SearchResult = struct {
@@ -1411,6 +1976,8 @@ pub const VectorDB = struct {
         while (i < vectors.len) : (i += 1) {
             try self.index.insert(start_idx + i, &self.storage);
         }
+
+        self.turbo_dirty = true;
     }
 
     pub fn searchBatch(self: *VectorDB, queries: []const []const f32, k: usize) ![][]SearchResult {
@@ -1802,4 +2369,47 @@ test "addBatch validates dimensions" {
     const batch = [_][]const f32{ &v_ok, &v_bad };
 
     try std.testing.expectError(error.InvalidDimension, db.addBatch(&batch));
+}
+
+test "turbo IVF uses mmap postings for file-backed mode" {
+    const allocator = std.testing.allocator;
+    const data_path = "turbo_vectors_test.db";
+    const postings_path = "turbo_vectors_test.db.ivf.postings";
+    defer fs.cwd().deleteFile(postings_path) catch {};
+    defer fs.cwd().deleteFile(data_path) catch {};
+
+    var db = try VectorDB.init(allocator, 8, .{
+        .initial_capacity = 256,
+        .file_path = data_path,
+        .enable_turbo = true,
+        .ivf_min_vectors = 16,
+        .ivf_nlist = 8,
+        .ivf_probes = 4,
+        .ivf_rerank_factor = 4,
+    });
+    defer db.deinit();
+
+    var rng = std.Random.DefaultPrng.init(1234);
+    const vectors = try allocator.alloc([8]f32, 128);
+    defer allocator.free(vectors);
+    for (vectors) |*vec| {
+        for (vec) |*v| {
+            v.* = rng.random().float(f32) * 2.0 - 1.0;
+        }
+        VectorOps.normalize(vec);
+    }
+
+    const slices = try allocator.alloc([]const f32, vectors.len);
+    defer allocator.free(slices);
+    for (vectors, 0..) |*vec, i| slices[i] = vec;
+    try db.addBatch(slices);
+    try db.rebuildTurboIndex();
+
+    const results = try db.search(slices[0], 5);
+    defer allocator.free(results);
+    try std.testing.expect(results.len > 0);
+    try std.testing.expect(db.ivf_postings_is_mmap);
+
+    const stat = try fs.cwd().statFile(postings_path);
+    try std.testing.expect(stat.size >= @as(u64, @intCast(db.storage.count * @sizeOf(usize))));
 }
