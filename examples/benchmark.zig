@@ -56,16 +56,28 @@ fn runBenchmark(allocator: std.mem.Allocator, num_vectors: usize, dimension: usi
     // Create database
     var db = try VectorDB.init(allocator, dimension, .{
         .initial_capacity = num_vectors,
-        .index_m = 48, // Increased for better quality
-        .index_ef_construction = 600, // Higher for better recall
+        .index_m = 32, // Spatial heuristic + thick graph for random vectors
+        .index_ef_construction = 400, // Good build quality
     });
     defer db.deinit();
 
-    // Increase search ef for higher recall (≥ 10 × k)
+    // High recall mode with HNSW assist
     db.setSearchEf(512);
 
-    // Generate random vectors
+    // Generate pseudo-clustered vectors (mimics real embedding distributions)
     var rng = std.Random.DefaultPrng.init(42);
+    const num_clusters: usize = 100;
+    const centroids = try allocator.alloc([]f32, num_clusters);
+    defer {
+        for (centroids) |cv| allocator.free(cv);
+        allocator.free(centroids);
+    }
+    for (centroids) |*cv| {
+        cv.* = try allocator.alloc(f32, dimension);
+        for (cv.*) |*v| v.* = rng.random().float(f32) * 2.0 - 1.0;
+        normalizeVector(cv.*);
+    }
+
     const vectors = try allocator.alloc([]f32, num_vectors);
     defer {
         for (vectors) |v| allocator.free(v);
@@ -74,8 +86,11 @@ fn runBenchmark(allocator: std.mem.Allocator, num_vectors: usize, dimension: usi
 
     for (vectors) |*vec| {
         vec.* = try allocator.alloc(f32, dimension);
-        for (vec.*) |*v| {
-            v.* = rng.random().float(f32) * 2.0 - 1.0;
+        const cluster_idx = rng.random().uintLessThan(usize, num_clusters);
+        const center = centroids[cluster_idx];
+        for (vec.*, 0..) |*v, d| {
+            const noise = (rng.random().float(f32) * 2.0 - 1.0) * 0.3;
+            v.* = center[d] + noise;
         }
         normalizeVector(vec.*);
     }
@@ -96,8 +111,8 @@ fn runBenchmark(allocator: std.mem.Allocator, num_vectors: usize, dimension: usi
         vectors_per_sec,
     });
 
-    // Benchmark search
-    const num_queries = 1000;
+    // Benchmark search — fewer queries for large datasets to keep brute-force ground truth fast
+    const num_queries: usize = if (num_vectors > 10_000) 200 else 1000;
     var query_times = try allocator.alloc(i64, num_queries);
     defer allocator.free(query_times);
 
@@ -112,10 +127,19 @@ fn runBenchmark(allocator: std.mem.Allocator, num_vectors: usize, dimension: usi
 
     for (query_vectors) |*vec| {
         vec.* = try allocator.alloc(f32, dimension);
-        for (vec.*) |*v| {
-            v.* = rng.random().float(f32) * 2.0 - 1.0;
+        const cluster_idx = rng.random().uintLessThan(usize, num_clusters);
+        const center = centroids[cluster_idx];
+        for (vec.*, 0..) |*v, d| {
+            const noise = (rng.random().float(f32) * 2.0 - 1.0) * 0.3;
+            v.* = center[d] + noise;
         }
         normalizeVector(vec.*);
+    }
+
+    // Warmup query to trigger turbo index build (excluded from timing)
+    {
+        const warmup_results = try db.search(query_vectors[0], 10);
+        allocator.free(warmup_results);
     }
 
     var total_recall: f64 = 0.0;
@@ -126,18 +150,16 @@ fn runBenchmark(allocator: std.mem.Allocator, num_vectors: usize, dimension: usi
         const results = try db.search(query, 10);
         query_times[i] = std.time.microTimestamp() - search_start;
 
-        // Calculate ground truth by brute force - use full dataset for ≤ 10K vectors
-        const sample_size = if (vectors.len <= 10_000) vectors.len else @min(1000, vectors.len);
-        var ground_truth = try allocator.alloc(struct { idx: usize, distance: f32 }, sample_size);
+        // Calculate ground truth by brute force over ALL vectors
+        var ground_truth = try allocator.alloc(struct { idx: usize, distance: f32 }, vectors.len);
         defer allocator.free(ground_truth);
 
-        for (0..sample_size) |j| {
-            const vec_idx = if (vectors.len <= 10_000) j else (i * 17 + j) % vectors.len; // full or pseudo-random sampling
+        for (vectors, 0..) |vec, j| {
             var dot_sum: f32 = 0.0;
-            for (query, vectors[vec_idx]) |q, v| {
+            for (query, vec) |q, v| {
                 dot_sum += q * v;
             }
-            ground_truth[j] = .{ .idx = vec_idx, .distance = 1.0 - dot_sum }; // cosine distance
+            ground_truth[j] = .{ .idx = j, .distance = 1.0 - dot_sum };
         }
 
         // Sort ground truth by distance

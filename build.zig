@@ -73,6 +73,13 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const storage_mode = b.option([]const u8, "storage", "Storage precision: f32 (default), f16, or sq8") orelse "f32";
+    if (!std.mem.eql(u8, storage_mode, "f32") and !std.mem.eql(u8, storage_mode, "f16") and !std.mem.eql(u8, storage_mode, "sq8")) {
+        @panic("invalid -Dstorage option (expected f32, f16, or sq8)");
+    }
+
+    const options = b.addOptions();
+    options.addOption([]const u8, "storage_mode", storage_mode);
 
     // Library
     const lib = b.addStaticLibrary(.{
@@ -81,6 +88,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    lib.root_module.addOptions("config", options);
     b.installArtifact(lib);
 
     // Main executable
@@ -90,6 +98,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    exe.root_module.addOptions("config", options);
     b.installArtifact(exe);
 
     // Run command
@@ -146,6 +155,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    lib_unit_tests.root_module.addOptions("config", options);
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_unit_tests.step);

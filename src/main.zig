@@ -4,6 +4,23 @@ const mem = std.mem;
 const os = std.os;
 const fs = std.fs;
 const builtin = @import("builtin");
+const config = @import("config");
+
+const STORAGE_MODE: []const u8 = config.storage_mode;
+comptime {
+    if (!std.mem.eql(u8, STORAGE_MODE, "f32") and
+        !std.mem.eql(u8, STORAGE_MODE, "f16") and
+        !std.mem.eql(u8, STORAGE_MODE, "sq8"))
+    {
+        @compileError("config.storage_mode must be \"f32\", \"f16\", or \"sq8\"");
+    }
+}
+const StorageScalar = if (std.mem.eql(u8, STORAGE_MODE, "f16"))
+    f16
+else if (std.mem.eql(u8, STORAGE_MODE, "sq8"))
+    i8
+else
+    f32;
 
 // Configuration constants
 const VECTOR_ALIGNMENT = 64; // For AVX-512 and cache line alignment
@@ -13,12 +30,30 @@ const MMAP_THRESHOLD = 1024 * 1024; // 1MB
 const PAGE_ALIGNMENT = 16384; // Common page size on macOS
 const PREFETCH_DISTANCE = 256; // Prefetch distance for memory access
 const CACHE_LINE_SIZE = 64;
-const BRUTE_FORCE_THRESHOLD = 4096;
+const BRUTE_FORCE_THRESHOLD = 512;
 const IVF_MIN_VECTORS_DEFAULT = 8192;
 const IVF_MIN_LISTS = 16;
 const IVF_MAX_LISTS = 512;
 const IVF_DEFAULT_PROBES = 8;
 const STORAGE_SLAB_VECTORS = 16_384;
+const INT8_SCALE: f32 = 127.0;
+const INT8_INV_SCALE: f32 = 1.0 / INT8_SCALE;
+const INT8_INV_SCALE_SQ: f32 = INT8_INV_SCALE * INT8_INV_SCALE;
+
+fn configuredCpuCount() usize {
+    const cpu_count = @max(1, std.Thread.getCpuCount() catch 1);
+    const raw = std.posix.getenv("ZECTOR_MAX_THREADS") orelse return cpu_count;
+    const parsed = std.fmt.parseUnsigned(usize, raw, 10) catch return cpu_count;
+    if (parsed == 0) return cpu_count;
+    return @max(1, @min(cpu_count, parsed));
+}
+
+fn configuredDemoVectorCount(default_count: usize) usize {
+    const raw = std.posix.getenv("ZECTOR_DEMO_VECTORS") orelse return default_count;
+    const parsed = std.fmt.parseUnsigned(usize, raw, 10) catch return default_count;
+    if (parsed == 0) return default_count;
+    return parsed;
+}
 
 // Vector operations using SIMD when available
 const VectorOps = struct {
@@ -257,6 +292,123 @@ const VectorOps = struct {
         return 1.0 - dotFast(a, b);
     }
 
+    pub inline fn toF32(v: StorageScalar) f32 {
+        if (comptime StorageScalar == f32) return v;
+        if (comptime StorageScalar == f16) return @as(f32, @floatCast(v));
+        return @as(f32, @floatFromInt(v)) * INT8_INV_SCALE;
+    }
+
+    pub inline fn quantizeUnit(v: f32) i8 {
+        const scaled = std.math.clamp(v * INT8_SCALE, -INT8_SCALE, INT8_SCALE);
+        return @as(i8, @intFromFloat(@round(scaled)));
+    }
+
+    /// Hamming distance between two binary vectors (packed as u64 words)
+    pub fn hammingDistance(a: []const u64, b: []const u64) u32 {
+        std.debug.assert(a.len == b.len);
+        var dist: u32 = 0;
+        for (a, b) |aw, bw| {
+            dist += @popCount(aw ^ bw);
+        }
+        return dist;
+    }
+
+    /// Encode a f32 vector as a binary vector (sign bits packed into u64 words)
+    pub fn binaryEncode(src: []const f32, dst: []u64) void {
+        const words = src.len / 64;
+        const remainder = src.len % 64;
+        var w: usize = 0;
+        while (w < words) : (w += 1) {
+            var bits: u64 = 0;
+            for (0..64) |b| {
+                if (src[w * 64 + b] >= 0) bits |= @as(u64, 1) << @intCast(b);
+            }
+            dst[w] = bits;
+        }
+        if (remainder > 0 and w < dst.len) {
+            var bits: u64 = 0;
+            for (0..remainder) |b| {
+                if (src[words * 64 + b] >= 0) bits |= @as(u64, 1) << @intCast(b);
+            }
+            dst[w] = bits;
+        }
+    }
+
+    /// Encode a StorageScalar vector as binary
+    pub fn binaryEncodeStorage(src: []const StorageScalar, dst: []u64) void {
+        const words = src.len / 64;
+        const remainder = src.len % 64;
+        var w: usize = 0;
+        while (w < words) : (w += 1) {
+            var bits: u64 = 0;
+            for (0..64) |b| {
+                if (toF32(src[w * 64 + b]) >= 0) bits |= @as(u64, 1) << @intCast(b);
+            }
+            dst[w] = bits;
+        }
+        if (remainder > 0 and w < dst.len) {
+            var bits: u64 = 0;
+            for (0..remainder) |b| {
+                if (toF32(src[words * 64 + b]) >= 0) bits |= @as(u64, 1) << @intCast(b);
+            }
+            dst[w] = bits;
+        }
+    }
+
+    /// SIMD-accelerated batch quantization of a normalized f32 vector to i8
+    pub fn quantizeBatch(src: []const f32, dst: []i8) void {
+        std.debug.assert(src.len == dst.len);
+        const vec_len = 4;
+        const scale_vec = @as(@Vector(vec_len, f32), @splat(INT8_SCALE));
+        const min_vec = @as(@Vector(vec_len, f32), @splat(-INT8_SCALE));
+        const max_vec = @as(@Vector(vec_len, f32), @splat(INT8_SCALE));
+
+        const simd_len = src.len - (src.len % vec_len);
+        var i: usize = 0;
+        while (i < simd_len) : (i += vec_len) {
+            const v = @as(@Vector(vec_len, f32), src[i..][0..vec_len].*);
+            const scaled = @min(@max(v * scale_vec, min_vec), max_vec);
+            // Convert to i32 then narrow to i8
+            const rounded: @Vector(vec_len, i32) = @intFromFloat(scaled);
+            inline for (0..vec_len) |j| {
+                dst[i + j] = @as(i8, @intCast(std.math.clamp(rounded[j], -127, 127)));
+            }
+        }
+        while (i < src.len) : (i += 1) {
+            dst[i] = quantizeUnit(src[i]);
+        }
+    }
+
+    pub inline fn dotStorage(a: []const StorageScalar, b: []const StorageScalar) f32 {
+        std.debug.assert(a.len == b.len);
+        if (comptime StorageScalar == f32) {
+            return dotFast(a, b);
+        }
+        if (comptime StorageScalar == f16) {
+            return dotF16(a, b);
+        }
+        return @as(f32, @floatFromInt(dotI8(a, b))) * INT8_INV_SCALE_SQ;
+    }
+
+    pub inline fn dotQueryStorage(query: []const f32, stored: []const StorageScalar) f32 {
+        std.debug.assert(query.len == stored.len);
+        if (comptime StorageScalar == f32) {
+            return dotFast(query, stored);
+        }
+        if (comptime StorageScalar == f16) {
+            return dotQueryF16(query, stored);
+        }
+        return dotQueryI8(query, stored);
+    }
+
+    pub inline fn cosineDistanceStorage(a: []const StorageScalar, b: []const StorageScalar) f32 {
+        return 1.0 - dotStorage(a, b);
+    }
+
+    pub inline fn cosineDistanceQueryStorage(query: []const f32, stored: []const StorageScalar) f32 {
+        return 1.0 - dotQueryStorage(query, stored);
+    }
+
     pub fn euclideanDistance(a: []const f32, b: []const f32) f32 {
         std.debug.assert(a.len == b.len);
         var sum: f32 = 0.0;
@@ -267,35 +419,203 @@ const VectorOps = struct {
         return math.sqrt(sum);
     }
 
-    /// Normalize a vector to unit length in-place
+    /// Normalize a vector to unit length in-place (SIMD-accelerated)
     pub fn normalize(vec: []f32) void {
-        var sum: f32 = 0.0;
-        for (vec) |v| sum += v * v;
-        const norm = math.sqrt(sum);
-        if (norm > 0) {
-            for (vec) |*v| v.* /= norm;
+        const sq_norm = dotFast(vec, vec); // SIMD squared norm
+        if (sq_norm <= 0) return;
+        const inv_norm = 1.0 / math.sqrt(sq_norm);
+        // SIMD scaling (multiply is faster than divide)
+        const vec_len = 4;
+        const simd_len = vec.len - (vec.len % vec_len);
+        const scale = @as(@Vector(4, f32), @splat(inv_norm));
+        var i: usize = 0;
+        while (i < simd_len) : (i += vec_len) {
+            const v = @as(@Vector(4, f32), vec[i..][0..4].*);
+            vec[i..][0..4].* = @as([4]f32, v * scale);
+        }
+        while (i < vec.len) : (i += 1) {
+            vec[i] *= inv_norm;
         }
     }
 
-    fn dotNEON(a: []const f32, b: []const f32) f32 {
-        // Optimised dot product for ARM NEON (128-bit) – works on Apple Silicon
+    fn dotF16(a: []const f16, b: []const f16) f32 {
         std.debug.assert(a.len == b.len);
 
-        const vec_size = 4; // 128-bit NEON can process 4 floats per vector
+        const vec_len = 16;
+        const VF16 = @Vector(vec_len, f16);
+        const VF32 = @Vector(vec_len, f32);
+
+        var sum: f32 = 0.0;
+        var i: usize = 0;
+        while (i + vec_len <= a.len) : (i += vec_len) {
+            const va = @as(VF16, a[i..][0..vec_len].*);
+            const vb = @as(VF16, b[i..][0..vec_len].*);
+            const prod = @as(VF32, @floatCast(va * vb));
+            sum += @reduce(.Add, prod);
+        }
+
+        while (i < a.len) : (i += 1) {
+            sum += @as(f32, @floatCast(a[i])) * @as(f32, @floatCast(b[i]));
+        }
+
+        return sum;
+    }
+
+    fn dotQueryF16(query: []const f32, stored: []const f16) f32 {
+        std.debug.assert(query.len == stored.len);
+
+        const vec_len = 16;
+        const VF16 = @Vector(vec_len, f16);
+        const VF32 = @Vector(vec_len, f32);
+
+        var sum: f32 = 0.0;
+        var i: usize = 0;
+        while (i + vec_len <= query.len) : (i += vec_len) {
+            const qv = @as(VF32, query[i..][0..vec_len].*);
+            const sv = @as(VF32, @floatCast(@as(VF16, stored[i..][0..vec_len].*)));
+            sum += @reduce(.Add, qv * sv);
+        }
+
+        while (i < query.len) : (i += 1) {
+            sum += query[i] * @as(f32, @floatCast(stored[i]));
+        }
+
+        return sum;
+    }
+
+    pub inline fn dotI8(a: []const i8, b: []const i8) i32 {
+        std.debug.assert(a.len == b.len);
+        if (comptime builtin.cpu.arch == .aarch64 and
+            std.Target.aarch64.featureSetHas(builtin.cpu.features, .dotprod))
+        {
+            return dotI8Neon(a, b);
+        }
+        return dotI8Generic(a, b);
+    }
+
+    /// NEON SDOT path: processes 16 i8 pairs per instruction (4x faster than widen-to-i32).
+    /// SDOT computes four 4-element dot products, accumulating into 4 i32 lanes.
+    fn dotI8Neon(a: []const i8, b: []const i8) i32 {
+        var acc1: @Vector(4, i32) = @splat(0);
+        var acc2: @Vector(4, i32) = @splat(0);
+        var acc3: @Vector(4, i32) = @splat(0);
+        var acc4: @Vector(4, i32) = @splat(0);
+
+        const len = a.len;
+        const stride = 64; // 4x unrolled: 64 i8 pairs per iteration
+        const aligned64 = len - (len % stride);
+
+        var i: usize = 0;
+        while (i < aligned64) : (i += stride) {
+            const a1: @Vector(16, i8) = a[i..][0..16].*;
+            const b1: @Vector(16, i8) = b[i..][0..16].*;
+            acc1 = asm ("sdot %[d].4s, %[n].16b, %[m].16b"
+                : [d] "=w" (-> @Vector(4, i32)),
+                : [n] "w" (a1), [m] "w" (b1), [_] "0" (acc1),
+            );
+            const a2: @Vector(16, i8) = a[i + 16 ..][0..16].*;
+            const b2: @Vector(16, i8) = b[i + 16 ..][0..16].*;
+            acc2 = asm ("sdot %[d].4s, %[n].16b, %[m].16b"
+                : [d] "=w" (-> @Vector(4, i32)),
+                : [n] "w" (a2), [m] "w" (b2), [_] "0" (acc2),
+            );
+            const a3: @Vector(16, i8) = a[i + 32 ..][0..16].*;
+            const b3: @Vector(16, i8) = b[i + 32 ..][0..16].*;
+            acc3 = asm ("sdot %[d].4s, %[n].16b, %[m].16b"
+                : [d] "=w" (-> @Vector(4, i32)),
+                : [n] "w" (a3), [m] "w" (b3), [_] "0" (acc3),
+            );
+            const a4: @Vector(16, i8) = a[i + 48 ..][0..16].*;
+            const b4: @Vector(16, i8) = b[i + 48 ..][0..16].*;
+            acc4 = asm ("sdot %[d].4s, %[n].16b, %[m].16b"
+                : [d] "=w" (-> @Vector(4, i32)),
+                : [n] "w" (a4), [m] "w" (b4), [_] "0" (acc4),
+            );
+        }
+
+        // Remaining 16-byte chunks
+        while (i + 16 <= len) : (i += 16) {
+            const av: @Vector(16, i8) = a[i..][0..16].*;
+            const bv: @Vector(16, i8) = b[i..][0..16].*;
+            acc1 = asm ("sdot %[d].4s, %[n].16b, %[m].16b"
+                : [d] "=w" (-> @Vector(4, i32)),
+                : [n] "w" (av), [m] "w" (bv), [_] "0" (acc1),
+            );
+        }
+
+        var sum = @reduce(.Add, acc1 + acc2 + acc3 + acc4);
+        while (i < len) : (i += 1) {
+            sum += @as(i32, a[i]) * @as(i32, b[i]);
+        }
+        return sum;
+    }
+
+    /// Generic fallback: widen i8→i32 then multiply (for non-ARM or without dotprod).
+    fn dotI8Generic(a: []const i8, b: []const i8) i32 {
+        const vec_len = 16;
+        const simd_len = a.len - (a.len % vec_len);
+
+        var acc1 = @as(@Vector(16, i32), @splat(@as(i32, 0)));
+        var acc2 = @as(@Vector(16, i32), @splat(@as(i32, 0)));
+
+        var i: usize = 0;
+        const unroll_len = simd_len - (simd_len % (vec_len * 2));
+
+        while (i < unroll_len) : (i += vec_len * 2) {
+            const va1: @Vector(16, i32) = @intCast(@as(@Vector(16, i8), a[i..][0..16].*));
+            const vb1: @Vector(16, i32) = @intCast(@as(@Vector(16, i8), b[i..][0..16].*));
+            acc1 += va1 * vb1;
+
+            const va2: @Vector(16, i32) = @intCast(@as(@Vector(16, i8), a[i + 16 ..][0..16].*));
+            const vb2: @Vector(16, i32) = @intCast(@as(@Vector(16, i8), b[i + 16 ..][0..16].*));
+            acc2 += va2 * vb2;
+        }
+
+        while (i < simd_len) : (i += vec_len) {
+            const va: @Vector(16, i32) = @intCast(@as(@Vector(16, i8), a[i..][0..16].*));
+            const vb: @Vector(16, i32) = @intCast(@as(@Vector(16, i8), b[i..][0..16].*));
+            acc1 += va * vb;
+        }
+
+        var sum = @reduce(.Add, acc1 + acc2);
+        while (i < a.len) : (i += 1) {
+            sum += @as(i32, @intCast(a[i])) * @as(i32, @intCast(b[i]));
+        }
+        return sum;
+    }
+
+    fn dotQueryI8(query: []const f32, stored: []const i8) f32 {
+        std.debug.assert(query.len == stored.len);
+
+        var sum: f32 = 0.0;
+        var i: usize = 0;
+        while (i < query.len) : (i += 1) {
+            sum += query[i] * (@as(f32, @floatFromInt(stored[i])) * INT8_INV_SCALE);
+        }
+        return sum;
+    }
+
+    fn dotNEON(a: []const f32, b: []const f32) f32 {
+        // Optimised dot product for ARM NEON – 8 accumulators, 32 floats/iter
+        std.debug.assert(a.len == b.len);
+
+        const vec_size = 4;
         const simd_len = a.len - (a.len % vec_size);
 
-        // Multiple accumulators to hide latency on A-series cores
+        // 8 accumulators to saturate Apple Silicon NEON execution units
         var acc1 = @as(@Vector(4, f32), @splat(0.0));
         var acc2 = @as(@Vector(4, f32), @splat(0.0));
         var acc3 = @as(@Vector(4, f32), @splat(0.0));
         var acc4 = @as(@Vector(4, f32), @splat(0.0));
+        var acc5 = @as(@Vector(4, f32), @splat(0.0));
+        var acc6 = @as(@Vector(4, f32), @splat(0.0));
+        var acc7 = @as(@Vector(4, f32), @splat(0.0));
+        var acc8 = @as(@Vector(4, f32), @splat(0.0));
 
         var i: usize = 0;
-        const unroll_len = simd_len - (simd_len % 16); // 4×4 = 16 floats per full unrolled iter
+        const unroll_len = simd_len - (simd_len % 32);
 
-        // Process 16 floats (4 NEON registers) per iteration
-        while (i < unroll_len) : (i += 16) {
-            // Unroll – manual @as to guarantee vectors
+        while (i < unroll_len) : (i += 32) {
             const va1 = @as(@Vector(4, f32), a[i..][0..4].*);
             const vb1 = @as(@Vector(4, f32), b[i..][0..4].*);
             acc1 += va1 * vb1;
@@ -311,20 +631,38 @@ const VectorOps = struct {
             const va4 = @as(@Vector(4, f32), a[i + 12 ..][0..4].*);
             const vb4 = @as(@Vector(4, f32), b[i + 12 ..][0..4].*);
             acc4 += va4 * vb4;
+
+            const va5 = @as(@Vector(4, f32), a[i + 16 ..][0..4].*);
+            const vb5 = @as(@Vector(4, f32), b[i + 16 ..][0..4].*);
+            acc5 += va5 * vb5;
+
+            const va6 = @as(@Vector(4, f32), a[i + 20 ..][0..4].*);
+            const vb6 = @as(@Vector(4, f32), b[i + 20 ..][0..4].*);
+            acc6 += va6 * vb6;
+
+            const va7 = @as(@Vector(4, f32), a[i + 24 ..][0..4].*);
+            const vb7 = @as(@Vector(4, f32), b[i + 24 ..][0..4].*);
+            acc7 += va7 * vb7;
+
+            const va8 = @as(@Vector(4, f32), a[i + 28 ..][0..4].*);
+            const vb8 = @as(@Vector(4, f32), b[i + 28 ..][0..4].*);
+            acc8 += va8 * vb8;
         }
 
-        // Handle the remaining 4-float chunks
         while (i < simd_len) : (i += vec_size) {
             const va = @as(@Vector(4, f32), a[i..][0..4].*);
             const vb = @as(@Vector(4, f32), b[i..][0..4].*);
             acc1 += va * vb;
         }
 
-        // Combine accumulators
-        const combined = acc1 + acc2 + acc3 + acc4;
-        var sum: f32 = @reduce(.Add, combined);
+        const combined12 = acc1 + acc2;
+        const combined34 = acc3 + acc4;
+        const combined56 = acc5 + acc6;
+        const combined78 = acc7 + acc8;
+        const combined1234 = combined12 + combined34;
+        const combined5678 = combined56 + combined78;
+        var sum: f32 = @reduce(.Add, combined1234 + combined5678);
 
-        // Handle any remaining scalar elements
         while (i < a.len) : (i += 1) {
             sum += a[i] * b[i];
         }
@@ -385,7 +723,7 @@ const VectorStorage = struct {
         const file = try fs.cwd().createFile(path, .{ .read = true });
         errdefer file.close();
 
-        const vector_size = dimension * @sizeOf(f32);
+        const vector_size = dimension * @sizeOf(StorageScalar);
         const initial_size = 1024 * vector_size; // Start with 1024 vectors
 
         try file.setEndPos(initial_size);
@@ -441,7 +779,7 @@ const VectorStorage = struct {
     }
 
     fn addSlab(self: *VectorStorage, vectors: usize) !void {
-        const vector_size = self.dimension * @sizeOf(f32);
+        const vector_size = self.dimension * @sizeOf(StorageScalar);
         const slab_size = vectors * vector_size;
         const slab = try self.allocator.alignedAlloc(u8, VECTOR_ALIGNMENT, slab_size);
         try self.slabs.append(slab);
@@ -455,7 +793,7 @@ const VectorStorage = struct {
         std.debug.assert(idx < self.capacity);
         std.debug.assert(vector.len == self.dimension);
 
-        const vector_size = self.dimension * @sizeOf(f32);
+        const vector_size = self.dimension * @sizeOf(StorageScalar);
         const dest = if (self.use_slabs) blk: {
             const slab_idx = idx / self.slab_capacity_vectors;
             const in_slab = idx % self.slab_capacity_vectors;
@@ -466,18 +804,30 @@ const VectorStorage = struct {
             const offset = idx * vector_size;
             break :blk self.data[offset..][0..vector_size];
         };
-        const dest_f32 = @as([*]f32, @ptrCast(@alignCast(dest.ptr)))[0..vector.len];
+        const dest_storage = @as([*]StorageScalar, @ptrCast(@alignCast(dest.ptr)))[0..vector.len];
 
-        var sum: f32 = 0.0;
-        for (vector, 0..) |v, i| {
-            dest_f32[i] = v;
-            sum += v * v;
-        }
-
-        if (sum > 0) {
-            const inv_norm = 1.0 / @sqrt(sum);
-            for (dest_f32) |*v| {
-                v.* *= inv_norm;
+        const sum = VectorOps.dotFast(vector, vector); // SIMD squared norm
+        const inv_norm: f32 = if (sum > 0) 1.0 / @sqrt(sum) else 1.0;
+        if (comptime StorageScalar == f32) {
+            // SIMD-accelerated normalize + store
+            const vec_len = 4;
+            const simd_len = vector.len - (vector.len % vec_len);
+            const scale = @as(@Vector(4, f32), @splat(inv_norm));
+            var si: usize = 0;
+            while (si < simd_len) : (si += vec_len) {
+                const v = @as(@Vector(4, f32), vector[si..][0..4].*);
+                dest_storage[si..][0..4].* = @as([4]f32, v * scale);
+            }
+            while (si < vector.len) : (si += 1) {
+                dest_storage[si] = vector[si] * inv_norm;
+            }
+        } else if (comptime StorageScalar == f16) {
+            for (vector, 0..) |v, i| {
+                dest_storage[i] = @as(StorageScalar, @floatCast(v * inv_norm));
+            }
+        } else {
+            for (vector, 0..) |v, i| {
+                dest_storage[i] = VectorOps.quantizeUnit(v * inv_norm);
             }
         }
     }
@@ -495,9 +845,9 @@ const VectorStorage = struct {
         return idx;
     }
 
-    pub fn getVector(self: VectorStorage, idx: usize) []const f32 {
+    pub fn getVector(self: VectorStorage, idx: usize) []const StorageScalar {
         std.debug.assert(idx < self.count);
-        const vector_size = self.dimension * @sizeOf(f32);
+        const vector_size = self.dimension * @sizeOf(StorageScalar);
         const bytes = if (self.use_slabs) blk: {
             const slab_idx = idx / self.slab_capacity_vectors;
             const in_slab = idx % self.slab_capacity_vectors;
@@ -508,7 +858,27 @@ const VectorStorage = struct {
             const offset = idx * vector_size;
             break :blk self.data[offset..][0..vector_size];
         };
-        return @as([*]const f32, @ptrCast(@alignCast(bytes.ptr)))[0..self.dimension];
+        return @as([*]const StorageScalar, @ptrCast(@alignCast(bytes.ptr)))[0..self.dimension];
+    }
+
+    fn getVectorBytes(self: VectorStorage, idx: usize) []const u8 {
+        const vector_size = self.dimension * @sizeOf(StorageScalar);
+        if (self.use_slabs) {
+            const slab_idx = idx / self.slab_capacity_vectors;
+            const in_slab = idx % self.slab_capacity_vectors;
+            return self.slabs.items[slab_idx][in_slab * vector_size ..][0..vector_size];
+        }
+        return self.data[idx * vector_size ..][0..vector_size];
+    }
+
+    fn getVectorBytesMut(self: *VectorStorage, idx: usize) []u8 {
+        const vector_size = self.dimension * @sizeOf(StorageScalar);
+        if (self.use_slabs) {
+            const slab_idx = idx / self.slab_capacity_vectors;
+            const in_slab = idx % self.slab_capacity_vectors;
+            return self.slabs.items[slab_idx][in_slab * vector_size ..][0..vector_size];
+        }
+        return self.data[idx * vector_size ..][0..vector_size];
     }
 
     /// Pre-allocate storage capacity for batch operations
@@ -529,7 +899,7 @@ const VectorStorage = struct {
             new_capacity *= 2;
         }
 
-        const vector_size = self.dimension * @sizeOf(f32);
+        const vector_size = self.dimension * @sizeOf(StorageScalar);
         const new_size = new_capacity * vector_size;
 
         if (self.file) |file| {
@@ -572,7 +942,7 @@ const VectorStorage = struct {
 
         try self.reserveCapacity(vectors.len);
 
-        const cpu_count = @max(1, std.Thread.getCpuCount() catch 1);
+        const cpu_count = configuredCpuCount();
         const thread_count = @max(1, @min(cpu_count, vectors.len));
 
         if (thread_count > 1 and vectors.len >= thread_count * 64) {
@@ -622,7 +992,7 @@ const VectorStorage = struct {
         }
 
         const new_capacity = self.capacity * 2;
-        const vector_size = self.dimension * @sizeOf(f32);
+        const vector_size = self.dimension * @sizeOf(StorageScalar);
         const new_size = new_capacity * vector_size;
 
         if (self.file) |file| {
@@ -655,6 +1025,10 @@ const VectorStorage = struct {
     }
 };
 
+// Thread-local fast path for HNSW query scratch context.
+threadlocal var tl_search_context: ?*HNSWIndex.SearchContext = null;
+threadlocal var tl_search_owner: ?*HNSWIndex = null;
+
 // Hierarchical Navigable Small World (HNSW) index for fast similarity search
 const HNSWIndex = struct {
     const Connection = struct {
@@ -667,6 +1041,7 @@ const HNSWIndex = struct {
         level: u8,
         /// (offset, length) pairs for each level in the edge pool
         connections: []Connection,
+        lock: std.atomic.Value(u8) align(CACHE_LINE_SIZE) = std.atomic.Value(u8).init(0),
 
         pub fn init(allocator: mem.Allocator, level: u8) !Node {
             const connections = try allocator.alloc(Connection, level + 1);
@@ -682,6 +1057,34 @@ const HNSWIndex = struct {
         pub fn deinit(self: *Node, allocator: mem.Allocator) void {
             allocator.free(self.connections);
         }
+
+        /// True user-space spinlock: CAS fast path + exponential backoff.
+        /// No syscalls, no OS scheduler involvement — pure atomic operations.
+        pub inline fn spinLock(self: *Node) void {
+            // Fast path: uncontested lock
+            if (self.lock.cmpxchgWeak(0, 1, .acquire, .monotonic) == null) return;
+            self.spinLockSlow();
+        }
+
+        fn spinLockSlow(self: *Node) void {
+            var spin: u3 = 0;
+            while (true) {
+                if (self.lock.cmpxchgWeak(0, 1, .acquire, .monotonic) == null) return;
+                // Exponential backoff: 1, 2, 4, ... 128 YIELD/PAUSE hints
+                const spins = @as(u8, 1) << spin;
+                for (0..spins) |_| std.atomic.spinLoopHint();
+                spin +|= 1;
+            }
+        }
+
+        pub inline fn spinUnlock(self: *Node) void {
+            self.lock.store(0, .release);
+        }
+
+        /// Non-blocking lock attempt. Returns true if acquired, false if contended.
+        pub inline fn trySpinLock(self: *Node) bool {
+            return self.lock.cmpxchgWeak(0, 1, .acquire, .monotonic) == null;
+        }
     };
 
     const SearchItem = struct {
@@ -694,6 +1097,7 @@ const HNSWIndex = struct {
         visited: []u32,
         candidates: []SearchItem,
         w: []SearchItem,
+        scratch_results: []SearchItem,
         mark: u32,
     };
 
@@ -715,6 +1119,7 @@ const HNSWIndex = struct {
     scratch_mark: u32,
     search_contexts: std.ArrayList(*SearchContext),
     search_contexts_lock: std.Thread.Mutex,
+    edge_pool_mutex: std.Thread.Mutex,
     build_rwlock: std.Thread.RwLock,
     entry_point: ?usize,
     m: usize, // Max connections per layer
@@ -739,6 +1144,7 @@ const HNSWIndex = struct {
             .scratch_mark = 1,
             .search_contexts = std.ArrayList(*SearchContext).init(allocator),
             .search_contexts_lock = .{},
+            .edge_pool_mutex = .{},
             .build_rwlock = .{},
             .entry_point = null,
             .m = m,
@@ -750,6 +1156,11 @@ const HNSWIndex = struct {
     }
 
     pub fn deinit(self: *HNSWIndex) void {
+        if (tl_search_owner == self) {
+            tl_search_context = null;
+            tl_search_owner = null;
+        }
+
         for (self.nodes.items) |*node| {
             node.deinit(self.allocator);
         }
@@ -765,6 +1176,7 @@ const HNSWIndex = struct {
             if (ctx.visited.len > 0) self.allocator.free(ctx.visited);
             if (ctx.candidates.len > 0) self.allocator.free(ctx.candidates);
             if (ctx.w.len > 0) self.allocator.free(ctx.w);
+            if (ctx.scratch_results.len > 0) self.allocator.free(ctx.scratch_results);
             self.allocator.destroy(ctx);
         }
         self.search_contexts.deinit();
@@ -787,7 +1199,7 @@ const HNSWIndex = struct {
     }
 
     fn ensureInsertScratch(self: *HNSWIndex, num_closest: usize) !void {
-        const candidate_cap = @max(num_closest * 16, 16);
+        const candidate_cap = @max(num_closest * 32, 64);
         const w_cap = @max(num_closest, 1);
 
         try ensureBuffer(u32, self.allocator, &self.scratch_visited, self.nodes.items.len);
@@ -809,12 +1221,13 @@ const HNSWIndex = struct {
         num_closest: usize,
         max_nodes: usize,
     ) !void {
-        const candidate_cap = @max(num_closest * 16, 16);
+        const candidate_cap = @max(num_closest * 32, 64);
         const w_cap = @max(num_closest, 1);
 
         try ensureBuffer(u32, self.allocator, &ctx.visited, max_nodes);
         try ensureBuffer(SearchItem, self.allocator, &ctx.candidates, candidate_cap);
         try ensureBuffer(SearchItem, self.allocator, &ctx.w, w_cap);
+        try ensureBuffer(SearchItem, self.allocator, &ctx.scratch_results, candidate_cap);
 
         if (ctx.mark == std.math.maxInt(u32)) {
             @memset(ctx.visited, 0);
@@ -825,27 +1238,41 @@ const HNSWIndex = struct {
     }
 
     fn acquireSearchContext(self: *HNSWIndex, num_closest: usize, max_nodes: usize) !*SearchContext {
-        self.search_contexts_lock.lock();
-        defer self.search_contexts_lock.unlock();
-
-        const thread_id = std.Thread.getCurrentId();
-        for (self.search_contexts.items) |ctx| {
-            if (ctx.thread_id == thread_id) {
+        // Fast path: one cached context per (thread, index).
+        if (tl_search_owner == self) {
+            if (tl_search_context) |ctx| {
                 try self.ensureSearchContextCapacity(ctx, num_closest, max_nodes);
                 return ctx;
             }
         }
 
         const ctx = try self.allocator.create(SearchContext);
+        errdefer {
+            if (ctx.visited.len > 0) self.allocator.free(ctx.visited);
+            if (ctx.candidates.len > 0) self.allocator.free(ctx.candidates);
+            if (ctx.w.len > 0) self.allocator.free(ctx.w);
+            if (ctx.scratch_results.len > 0) self.allocator.free(ctx.scratch_results);
+            self.allocator.destroy(ctx);
+        }
         ctx.* = .{
-            .thread_id = thread_id,
+            .thread_id = std.Thread.getCurrentId(),
             .visited = &[_]u32{},
             .candidates = &[_]SearchItem{},
             .w = &[_]SearchItem{},
+            .scratch_results = &[_]SearchItem{},
             .mark = 1,
         };
-        try self.search_contexts.append(ctx);
+
         try self.ensureSearchContextCapacity(ctx, num_closest, max_nodes);
+
+        {
+            self.search_contexts_lock.lock();
+            defer self.search_contexts_lock.unlock();
+            try self.search_contexts.append(ctx);
+        }
+
+        tl_search_context = ctx;
+        tl_search_owner = self;
         return ctx;
     }
 
@@ -948,9 +1375,15 @@ const HNSWIndex = struct {
 
         // Allocate on first use
         if (conn.capacity == 0) {
-            conn.offset = try self.allocateEdges(cap);
-            conn.capacity = cap;
-            conn.len = 0;
+            self.edge_pool_mutex.lock();
+            defer self.edge_pool_mutex.unlock();
+
+            // Double-check once we hold the pool growth lock.
+            if (conn.capacity == 0) {
+                conn.offset = try self.allocateEdges(cap);
+                conn.capacity = cap;
+                conn.len = 0;
+            }
         }
 
         const offset = conn.offset;
@@ -1011,93 +1444,253 @@ const HNSWIndex = struct {
     }
 
     pub fn insertParallel(self: *HNSWIndex, idx: usize, storage: *const VectorStorage) !void {
-        var level: u8 = 0;
-        var old_entry: usize = 0;
-        var entry_level: u8 = 0;
-
         {
             self.build_rwlock.lock();
-            errdefer self.build_rwlock.unlock();
+            defer self.build_rwlock.unlock();
 
-            level = self.selectLevel();
-            const node = try Node.init(self.allocator, level);
-
-            // Ensure we have enough nodes.
             while (self.nodes.items.len <= idx) {
                 try self.nodes.append(try Node.init(self.allocator, 0));
             }
+
+            const level = self.selectLevel();
             self.nodes.items[idx].deinit(self.allocator);
-            self.nodes.items[idx] = node;
+            self.nodes.items[idx] = try Node.init(self.allocator, level);
 
             if (self.entry_point == null) {
                 self.entry_point = idx;
                 self.max_level = level;
-                self.build_rwlock.unlock();
                 return;
             }
-
-            old_entry = self.entry_point.?;
-            entry_level = self.nodes.items[old_entry].level;
-            self.build_rwlock.unlock();
         }
 
-        var nearest_copy: []SearchItem = &[_]SearchItem{};
-        defer if (nearest_copy.len > 0) self.allocator.free(nearest_copy);
+        try self.insertParallelNoAlloc(idx, storage);
+    }
 
-        // Search phase can run concurrently across threads.
+    /// HNSW spatial pruning heuristic with "keep pruned" extension.
+    /// Selects diverse neighbors, then backfills with best pruned candidates
+    /// to maintain graph connectivity. Candidates must be sorted by distance ascending.
+    /// Returns the number of kept candidates (bubbled to the front of the slice).
+    fn selectNeighborsHeuristic(
+        _: *HNSWIndex,
+        candidates: []SearchItem,
+        m_max: usize,
+        storage: *const VectorStorage,
+    ) usize {
+        if (candidates.len <= 1) return @min(candidates.len, m_max);
+
+        var selected_count: usize = 0;
+        // Track pruned candidates for backfill (on stack, bounded by input size)
+        var pruned_buf: [1024]SearchItem = undefined;
+        var pruned_count: usize = 0;
+
+        for (candidates) |cand| {
+            if (selected_count >= m_max) break;
+
+            var discard = false;
+            const cand_vec = storage.getVector(cand.idx);
+
+            for (candidates[0..selected_count]) |selected| {
+                const sel_vec = storage.getVector(selected.idx);
+                const dist_to_selected = VectorOps.cosineDistanceStorage(cand_vec, sel_vec);
+
+                if (dist_to_selected < cand.distance * 1.2) {
+                    discard = true;
+                    break;
+                }
+            }
+
+            if (!discard) {
+                candidates[selected_count] = cand;
+                selected_count += 1;
+            } else if (pruned_count < pruned_buf.len) {
+                pruned_buf[pruned_count] = cand;
+                pruned_count += 1;
+            }
+        }
+
+        // Backfill: if heuristic was too aggressive, add best pruned candidates
+        // (already sorted by distance since input was sorted)
+        var pi: usize = 0;
+        while (selected_count < m_max and pi < pruned_count) {
+            candidates[selected_count] = pruned_buf[pi];
+            selected_count += 1;
+            pi += 1;
+        }
+
+        return selected_count;
+    }
+
+    /// Optimized concurrent insert path used by batch ingestion.
+    /// Expects `nodes[idx]` to already exist with a selected level.
+    pub fn insertParallelNoAlloc(self: *HNSWIndex, idx: usize, storage: *const VectorStorage) !void {
+        const level = self.nodes.items[idx].level;
+        var old_entry: usize = 0;
+        var entry_level: u8 = 0;
+
+        // Read a stable entry point.
         {
             self.build_rwlock.lockShared();
-            errdefer self.build_rwlock.unlockShared();
+            defer self.build_rwlock.unlockShared();
+
+            if (self.entry_point) |entry| {
+                old_entry = entry;
+                entry_level = self.nodes.items[entry].level;
+            } else {
+                return;
+            }
+        }
+
+        // Entry point for an empty graph has nothing to link yet.
+        if (idx == old_entry) return;
+
+        var nearest_copy: []SearchItem = &[_]SearchItem{};
+
+        // Search with shared lock, copy results, then link without global lock.
+        {
+            self.build_rwlock.lockShared();
+            defer self.build_rwlock.unlockShared();
 
             const vector = storage.getVector(idx);
             var current_entry = old_entry;
 
-            // Search from top layer to target layer.
             if (entry_level > 0) {
                 var l = @min(level, entry_level);
                 while (l > 0) : (l -= 1) {
                     const nearest_at_level = try self.searchLayerInsert(vector, current_entry, self.ef_construction, l, storage);
-                    std.debug.assert(nearest_at_level.len > 0);
-                    current_entry = nearest_at_level[0].idx;
+                    if (nearest_at_level.len > 0) {
+                        current_entry = nearest_at_level[0].idx;
+                    }
                 }
             }
 
             const nearest = try self.searchLayerInsert(vector, current_entry, self.ef_construction, 0, storage);
-            std.debug.assert(nearest.len > 0);
-            nearest_copy = try self.allocator.alloc(SearchItem, nearest.len);
-            @memcpy(nearest_copy, nearest);
+            const ctx = if (tl_search_owner == self and tl_search_context != null)
+                tl_search_context.?
+            else
+                try self.acquireSearchContext(@max(nearest.len, 1), self.nodes.items.len);
 
-            self.build_rwlock.unlockShared();
+            try ensureBuffer(SearchItem, self.allocator, &ctx.scratch_results, nearest.len);
+            @memcpy(ctx.scratch_results[0..nearest.len], nearest);
+            nearest_copy = ctx.scratch_results[0..nearest.len];
         }
 
-        // Link phase is serialized for structural safety.
-        self.build_rwlock.lock();
-        defer self.build_rwlock.unlock();
-
-        // Connect the new node.
         var l: usize = 0;
         while (l <= level) : (l += 1) {
             const m = if (l == 0) self.m * 2 else self.m;
-            const candidate_count = @min(m, nearest_copy.len);
-            for (nearest_copy[0..candidate_count]) |item| {
+
+            // Filter candidates valid for this level
+            var level_candidates_stack: [1024]SearchItem = undefined;
+            var lc_len: usize = 0;
+
+            for (nearest_copy) |item| {
+                if (item.idx == idx) continue;
+                if (l > self.nodes.items[item.idx].level) continue;
+                if (lc_len < level_candidates_stack.len) {
+                    level_candidates_stack[lc_len] = item;
+                    lc_len += 1;
+                }
+            }
+
+            // Apply HNSW spatial pruning heuristic for diverse neighbor selection
+            const keep_count = self.selectNeighborsHeuristic(
+                level_candidates_stack[0..lc_len],
+                m,
+                storage,
+            );
+
+            for (level_candidates_stack[0..keep_count]) |item| {
                 const neighbor = item.idx;
-                if (l > self.nodes.items[neighbor].level) continue;
                 const dist = item.distance;
+
+                // Self-node: single writer per idx, no lock needed
                 try self.addConnection(idx, neighbor, l, dist, storage);
-                try self.addConnection(neighbor, idx, l, dist, storage);
+
+                // Neighbor node: try-lock, skip if contended
+                {
+                    const neighbor_node = &self.nodes.items[neighbor];
+                    if (neighbor_node.trySpinLock()) {
+                        defer neighbor_node.spinUnlock();
+                        try self.addConnection(neighbor, idx, l, dist, storage);
+                    }
+                }
             }
         }
 
-        const current_entry_level = self.nodes.items[self.entry_point.?].level;
-        if (level > current_entry_level) {
-            self.entry_point = idx;
-            self.max_level = level;
+        // Publish higher-level entry points under exclusive lock.
+        if (level > self.max_level) {
+            self.build_rwlock.lock();
+            defer self.build_rwlock.unlock();
+
+            if (level > self.max_level) {
+                self.max_level = level;
+                self.entry_point = idx;
+            }
+        }
+    }
+
+    // ── Heap helpers for search priority queues ──────────────────────────
+
+    inline fn heapSiftUpMin(items: []SearchItem, pos: usize) void {
+        var child = pos;
+        while (child > 0) {
+            const parent = (child - 1) / 2;
+            if (items[child].distance >= items[parent].distance) break;
+            const tmp = items[child];
+            items[child] = items[parent];
+            items[parent] = tmp;
+            child = parent;
+        }
+    }
+
+    inline fn heapSiftDownMin(items: []SearchItem, pos: usize) void {
+        var parent = pos;
+        const len = items.len;
+        while (true) {
+            var smallest = parent;
+            const left = 2 * parent + 1;
+            const right = 2 * parent + 2;
+            if (left < len and items[left].distance < items[smallest].distance) smallest = left;
+            if (right < len and items[right].distance < items[smallest].distance) smallest = right;
+            if (smallest == parent) break;
+            const tmp = items[parent];
+            items[parent] = items[smallest];
+            items[smallest] = tmp;
+            parent = smallest;
+        }
+    }
+
+    inline fn heapSiftUpMax(items: []SearchItem, pos: usize) void {
+        var child = pos;
+        while (child > 0) {
+            const parent = (child - 1) / 2;
+            if (items[child].distance <= items[parent].distance) break;
+            const tmp = items[child];
+            items[child] = items[parent];
+            items[parent] = tmp;
+            child = parent;
+        }
+    }
+
+    inline fn heapSiftDownMax(items: []SearchItem, pos: usize) void {
+        var parent = pos;
+        const len = items.len;
+        while (true) {
+            var largest = parent;
+            const left = 2 * parent + 1;
+            const right = 2 * parent + 2;
+            if (left < len and items[left].distance > items[largest].distance) largest = left;
+            if (right < len and items[right].distance > items[largest].distance) largest = right;
+            if (largest == parent) break;
+            const tmp = items[parent];
+            items[parent] = items[largest];
+            items[largest] = tmp;
+            parent = largest;
         }
     }
 
     fn searchLayerInsert(
         self: *HNSWIndex,
-        query: []const f32,
+        query: []const StorageScalar,
         entry: usize,
         num_closest: usize,
         layer: usize,
@@ -1107,67 +1700,72 @@ const HNSWIndex = struct {
         const ctx = try self.acquireSearchContext(ef, self.nodes.items.len);
         const mark = ctx.mark;
         const visited = ctx.visited;
-        const candidates_items = ctx.candidates;
-        const w_items = ctx.w;
-        var candidates_len: usize = 0;
+        const c_items = ctx.candidates; // min-heap: closest candidate at top
+        const w_items = ctx.w; // max-heap: farthest result at top
+        var c_len: usize = 0;
         var w_len: usize = 0;
 
-        const entry_dist = VectorOps.cosineDistanceFast(query, storage.getVector(entry));
-        candidates_items[0] = .{ .idx = entry, .distance = entry_dist };
-        candidates_len = 1;
+        const entry_dist = VectorOps.cosineDistanceStorage(query, storage.getVector(entry));
+        c_items[0] = .{ .idx = entry, .distance = entry_dist };
+        c_len = 1;
         w_items[0] = .{ .idx = entry, .distance = entry_dist };
         w_len = 1;
         visited[entry] = mark;
 
-        var current_idx: usize = 0;
-        while (current_idx < candidates_len) {
-            const current = candidates_items[current_idx];
-            current_idx += 1;
+        while (c_len > 0) {
+            // Pop closest candidate (min-heap root)
+            const current = c_items[0];
+
+            // Early termination: closest candidate farther than worst result
+            if (w_len >= ef and current.distance > w_items[0].distance) break;
+
+            c_len -= 1;
+            if (c_len > 0) {
+                c_items[0] = c_items[c_len];
+                heapSiftDownMin(c_items[0..c_len], 0);
+            }
 
             if (layer > self.nodes.items[current.idx].level) continue;
             const connections = self.getConnections(current.idx, layer);
 
-            for (connections) |neighbor| {
+            // Prefetch first neighbor vectors + node metadata to hide memory latency
+            const pf_count = @min(connections.len, 8);
+            for (connections[0..pf_count]) |neighbor| {
+                const vec = storage.getVector(neighbor);
+                @prefetch(vec.ptr, .{ .rw = .read, .locality = 0, .cache = .data });
+                @prefetch(@as([*]const u8, @ptrCast(&self.nodes.items[neighbor])), .{ .rw = .read, .locality = 1, .cache = .data });
+            }
+
+            for (connections, 0..) |neighbor, ci| {
                 if (visited[neighbor] == mark) continue;
                 visited[neighbor] = mark;
 
-                const dist = VectorOps.cosineDistanceFast(query, storage.getVector(neighbor));
-
-                if (candidates_len < candidates_items.len) {
-                    candidates_items[candidates_len] = .{ .idx = neighbor, .distance = dist };
-                    candidates_len += 1;
+                // Prefetch ahead — both vectors and node metadata
+                if (ci + pf_count < connections.len) {
+                    const ahead_id = connections[ci + pf_count];
+                    const ahead = storage.getVector(ahead_id);
+                    @prefetch(ahead.ptr, .{ .rw = .read, .locality = 0, .cache = .data });
+                    @prefetch(@as([*]const u8, @ptrCast(&self.nodes.items[ahead_id])), .{ .rw = .read, .locality = 1, .cache = .data });
                 }
 
-                if (w_len < ef) {
-                    w_items[w_len] = .{ .idx = neighbor, .distance = dist };
-                    w_len += 1;
+                const dist = VectorOps.cosineDistanceStorage(query, storage.getVector(neighbor));
 
-                    var child = w_len - 1;
-                    while (child > 0) {
-                        const parent = (child - 1) / 2;
-                        if (w_items[child].distance <= w_items[parent].distance) break;
-                        std.mem.swap(SearchItem, &w_items[child], &w_items[parent]);
-                        child = parent;
+                if (w_len < ef or dist < w_items[0].distance) {
+                    // Push to candidate min-heap
+                    if (c_len < c_items.len) {
+                        c_items[c_len] = .{ .idx = neighbor, .distance = dist };
+                        heapSiftUpMin(c_items[0 .. c_len + 1], c_len);
+                        c_len += 1;
                     }
-                } else if (dist < w_items[0].distance) {
-                    w_items[0] = .{ .idx = neighbor, .distance = dist };
 
-                    var parent: usize = 0;
-                    while (true) {
-                        const left = 2 * parent + 1;
-                        const right = 2 * parent + 2;
-                        var largest = parent;
-
-                        if (left < w_len and w_items[left].distance > w_items[largest].distance) {
-                            largest = left;
-                        }
-                        if (right < w_len and w_items[right].distance > w_items[largest].distance) {
-                            largest = right;
-                        }
-
-                        if (largest == parent) break;
-                        std.mem.swap(SearchItem, &w_items[parent], &w_items[largest]);
-                        parent = largest;
+                    // Push to result max-heap
+                    if (w_len < ef) {
+                        w_items[w_len] = .{ .idx = neighbor, .distance = dist };
+                        heapSiftUpMax(w_items[0 .. w_len + 1], w_len);
+                        w_len += 1;
+                    } else {
+                        w_items[0] = .{ .idx = neighbor, .distance = dist };
+                        heapSiftDownMax(w_items[0..w_len], 0);
                     }
                 }
             }
@@ -1190,116 +1788,76 @@ const HNSWIndex = struct {
         num_closest: usize,
         layer: usize,
         storage: *const VectorStorage,
-    ) !std.ArrayList(usize) {
+    ) ![]SearchItem {
         const ef = @max(num_closest, 1);
         const ctx = try self.acquireSearchContext(ef, self.nodes.items.len);
         const visited = ctx.visited;
         const mark = ctx.mark;
-        const candidates_items = ctx.candidates;
-        const w_items = ctx.w;
-        var candidates_len: usize = 0;
+        const c_items = ctx.candidates; // min-heap: closest at top
+        const w_items = ctx.w; // max-heap: farthest at top
+        var c_len: usize = 0;
         var w_len: usize = 0;
 
-        const entry_dist = VectorOps.cosineDistanceFast(query, storage.getVector(entry));
-        candidates_items[0] = .{ .idx = entry, .distance = entry_dist };
-        candidates_len = 1;
+        const entry_dist = VectorOps.cosineDistanceQueryStorage(query, storage.getVector(entry));
+        c_items[0] = .{ .idx = entry, .distance = entry_dist };
+        c_len = 1;
         w_items[0] = .{ .idx = entry, .distance = entry_dist };
         w_len = 1;
         visited[entry] = mark;
 
-        // Prefetch the entry node's connections
-        const entry_node = &self.nodes.items[entry];
-        if (layer <= entry_node.level) {
-            const conn = entry_node.connections[layer];
-            if (conn.len > 0) {
-                @prefetch(self.edge_pool.items.ptr + conn.offset, .{ .rw = .read, .locality = 3, .cache = .data });
+        while (c_len > 0) {
+            // Pop closest candidate (min-heap root)
+            const current = c_items[0];
+
+            // Early termination: closest candidate farther than worst result
+            if (w_len >= ef and current.distance > w_items[0].distance) break;
+
+            c_len -= 1;
+            if (c_len > 0) {
+                c_items[0] = c_items[c_len];
+                heapSiftDownMin(c_items[0..c_len], 0);
             }
-        }
 
-        var current_idx: usize = 0;
-        while (current_idx < candidates_len) {
-            const current = candidates_items[current_idx];
-            current_idx += 1;
-
-            // Early termination based on distance bound
-            // if (w_len > 0 and current.distance > w_items[0].distance * 1.01) break;
-
-            // Skip if this node doesn't have connections at this layer
             if (layer > self.nodes.items[current.idx].level) continue;
-
             const connections = self.getConnections(current.idx, layer);
-            const distances = self.getDistances(current.idx, layer);
 
-            // Prefetch next candidate's data
-            if (current_idx < candidates_len) {
-                const next_idx = candidates_items[current_idx].idx;
-                if (layer <= self.nodes.items[next_idx].level) {
-                    const next_conn = self.nodes.items[next_idx].connections[layer];
-                    if (next_conn.len > 0) {
-                        @prefetch(self.edge_pool.items.ptr + next_conn.offset, .{ .rw = .read, .locality = 2, .cache = .data });
-                    }
-                }
+            // Prefetch first few neighbor vectors + their node metadata
+            const prefetch_count = @min(connections.len, 8);
+            for (connections[0..prefetch_count]) |neighbor| {
+                const vec = storage.getVector(neighbor);
+                @prefetch(vec.ptr, .{ .rw = .read, .locality = 0, .cache = .data });
+                // Prefetch node metadata for future graph expansion
+                @prefetch(@as([*]const u8, @ptrCast(&self.nodes.items[neighbor])), .{ .rw = .read, .locality = 1, .cache = .data });
             }
 
-            for (connections, distances) |neighbor, _| {
+            for (connections) |neighbor| {
                 if (visited[neighbor] == mark) continue;
                 visited[neighbor] = mark;
 
-                // Skip distance pruning - it kills recall
-                // const dist_lower_bound = @abs(current.distance - cached_dist);
-                // if (w_len >= num_closest and dist_lower_bound > w_items[0].distance * 1.2) continue;
+                const dist = VectorOps.cosineDistanceQueryStorage(query, storage.getVector(neighbor));
 
-                const neighbor_vec = storage.getVector(neighbor);
-                const dist = VectorOps.cosineDistanceFast(query, neighbor_vec);
-
-                // Always add to candidates for better exploration
-                if (candidates_len < candidates_items.len) {
-                    candidates_items[candidates_len] = .{ .idx = neighbor, .distance = dist };
-                    candidates_len += 1;
-                }
-
-                // Update w (maintain MAX-heap property - worst at root)
-                if (w_len < num_closest) {
-                    // Insert into heap
-                    w_items[w_len] = .{ .idx = neighbor, .distance = dist };
-                    w_len += 1;
-                    // Bubble up (max-heap)
-                    var child = w_len - 1;
-                    while (child > 0) {
-                        const parent = (child - 1) / 2;
-                        if (w_items[child].distance <= w_items[parent].distance) break;
-                        std.mem.swap(SearchItem, &w_items[child], &w_items[parent]);
-                        child = parent;
+                if (w_len < ef or dist < w_items[0].distance) {
+                    // Push to candidate min-heap
+                    if (c_len < c_items.len) {
+                        c_items[c_len] = .{ .idx = neighbor, .distance = dist };
+                        heapSiftUpMin(c_items[0 .. c_len + 1], c_len);
+                        c_len += 1;
                     }
-                } else if (dist < w_items[0].distance) {
-                    // Replace root (worst) and bubble down
-                    w_items[0] = .{ .idx = neighbor, .distance = dist };
-                    var parent: usize = 0;
-                    while (true) {
-                        const left = 2 * parent + 1;
-                        const right = 2 * parent + 2;
-                        var largest = parent;
 
-                        if (left < w_len and w_items[left].distance > w_items[largest].distance) {
-                            largest = left;
-                        }
-                        if (right < w_len and w_items[right].distance > w_items[largest].distance) {
-                            largest = right;
-                        }
-
-                        if (largest == parent) break;
-                        std.mem.swap(SearchItem, &w_items[parent], &w_items[largest]);
-                        parent = largest;
+                    // Push to result max-heap
+                    if (w_len < ef) {
+                        w_items[w_len] = .{ .idx = neighbor, .distance = dist };
+                        heapSiftUpMax(w_items[0 .. w_len + 1], w_len);
+                        w_len += 1;
+                    } else {
+                        w_items[0] = .{ .idx = neighbor, .distance = dist };
+                        heapSiftDownMax(w_items[0..w_len], 0);
                     }
                 }
             }
         }
 
-        // Extract results from min-heap
-        var result = std.ArrayList(usize).init(self.allocator);
-        try result.ensureTotalCapacity(w_len);
-
-        // Sort w_items by distance for consistent results
+        // Sort results by distance ascending
         std.sort.heap(SearchItem, w_items[0..w_len], {}, struct {
             fn lessThan(context: void, a: SearchItem, b: SearchItem) bool {
                 _ = context;
@@ -1307,11 +1865,102 @@ const HNSWIndex = struct {
             }
         }.lessThan);
 
-        for (w_items[0..w_len]) |item| {
-            result.appendAssumeCapacity(item.idx);
+        return w_items[0..w_len];
+    }
+
+    /// Int8-accelerated graph search for HNSW assist path.
+    /// Uses quantized int8 distances (~10x cheaper than f32) for graph traversal.
+    /// Returns candidate IDs with approximate distances — caller reranks with f32.
+    fn searchLayerI8(
+        self: *HNSWIndex,
+        query_q8: []const i8,
+        quantized_vectors: []const i8,
+        dim: usize,
+        entry: usize,
+        num_closest: usize,
+        layer: usize,
+    ) ![]SearchItem {
+        const ef = @max(num_closest, 1);
+        const ctx = try self.acquireSearchContext(ef, self.nodes.items.len);
+        const visited = ctx.visited;
+        const mark = ctx.mark;
+        const c_items = ctx.candidates;
+        const w_items = ctx.w;
+        var c_len: usize = 0;
+        var w_len: usize = 0;
+
+        // Entry point distance using int8
+        const entry_q = quantized_vectors[entry * dim ..][0..dim];
+        const entry_dot = VectorOps.dotI8(query_q8, entry_q);
+        const entry_dist = 1.0 - @as(f32, @floatFromInt(entry_dot)) * INT8_INV_SCALE_SQ;
+        c_items[0] = .{ .idx = entry, .distance = entry_dist };
+        c_len = 1;
+        w_items[0] = .{ .idx = entry, .distance = entry_dist };
+        w_len = 1;
+        visited[entry] = mark;
+
+        while (c_len > 0) {
+            const current = c_items[0];
+
+            if (w_len >= ef and current.distance > w_items[0].distance) break;
+
+            c_len -= 1;
+            if (c_len > 0) {
+                c_items[0] = c_items[c_len];
+                heapSiftDownMin(c_items[0..c_len], 0);
+            }
+
+            if (layer > self.nodes.items[current.idx].level) continue;
+            const connections = self.getConnections(current.idx, layer);
+
+            // Prefetch quantized vectors for first neighbors
+            const pf_count = @min(connections.len, 8);
+            for (connections[0..pf_count]) |neighbor| {
+                @prefetch(quantized_vectors.ptr + neighbor * dim, .{ .rw = .read, .locality = 0, .cache = .data });
+                @prefetch(@as([*]const u8, @ptrCast(&self.nodes.items[neighbor])), .{ .rw = .read, .locality = 1, .cache = .data });
+            }
+
+            for (connections, 0..) |neighbor, ci| {
+                if (visited[neighbor] == mark) continue;
+                visited[neighbor] = mark;
+
+                if (ci + pf_count < connections.len) {
+                    const ahead_id = connections[ci + pf_count];
+                    @prefetch(quantized_vectors.ptr + ahead_id * dim, .{ .rw = .read, .locality = 0, .cache = .data });
+                    @prefetch(@as([*]const u8, @ptrCast(&self.nodes.items[ahead_id])), .{ .rw = .read, .locality = 1, .cache = .data });
+                }
+
+                const qvec = quantized_vectors[neighbor * dim ..][0..dim];
+                const dot_i32 = VectorOps.dotI8(query_q8, qvec);
+                const dist = 1.0 - @as(f32, @floatFromInt(dot_i32)) * INT8_INV_SCALE_SQ;
+
+                if (w_len < ef or dist < w_items[0].distance) {
+                    if (c_len < c_items.len) {
+                        c_items[c_len] = .{ .idx = neighbor, .distance = dist };
+                        heapSiftUpMin(c_items[0 .. c_len + 1], c_len);
+                        c_len += 1;
+                    }
+
+                    if (w_len < ef) {
+                        w_items[w_len] = .{ .idx = neighbor, .distance = dist };
+                        heapSiftUpMax(w_items[0 .. w_len + 1], w_len);
+                        w_len += 1;
+                    } else {
+                        w_items[0] = .{ .idx = neighbor, .distance = dist };
+                        heapSiftDownMax(w_items[0..w_len], 0);
+                    }
+                }
+            }
         }
 
-        return result;
+        std.sort.heap(SearchItem, w_items[0..w_len], {}, struct {
+            fn lessThan(context: void, a: SearchItem, b: SearchItem) bool {
+                _ = context;
+                return a.distance < b.distance;
+            }
+        }.lessThan);
+
+        return w_items[0..w_len];
     }
 
     /// Efficient top-k selection using on-stack buffers for small sizes
@@ -1341,7 +1990,7 @@ const HNSWIndex = struct {
 
             for (candidates, 0..) |id, i| {
                 pairs[i] = DistanceIndex{
-                    .distance = VectorOps.cosineDistanceFast(base, storage.getVector(id)),
+                    .distance = VectorOps.cosineDistanceQueryStorage(base, storage.getVector(id)),
                     .candidate_idx = i,
                 };
             }
@@ -1367,7 +2016,7 @@ const HNSWIndex = struct {
 
             for (candidates, 0..) |id, i| {
                 pairs[i] = DistanceIndex{
-                    .distance = VectorOps.cosineDistanceFast(base, storage.getVector(id)),
+                    .distance = VectorOps.cosineDistanceQueryStorage(base, storage.getVector(id)),
                     .candidate_idx = i,
                 };
             }
@@ -1405,8 +2054,6 @@ const HNSWIndex = struct {
 pub const VectorDB = struct {
     const FILE_MAGIC: u32 = 0x5A454354; // "ZECT"
     const FILE_VERSION: u32 = 1;
-    const INT8_SCALE: f32 = 127.0;
-    const INT8_INV_SCALE_SQ: f32 = 1.0 / (INT8_SCALE * INT8_SCALE);
 
     const ApproxCandidate = struct {
         idx: usize,
@@ -1433,7 +2080,25 @@ pub const VectorDB = struct {
     ivf_postings_path: ?[]u8,
     ivf_postings_is_mmap: bool,
     quantized_vectors: []i8,
+    binary_vectors: []u64,
+    binary_words_per_vec: usize,
     storage_file_path: ?[]u8,
+
+    // Internal→external ID mapping (maintained across graph compaction)
+    internal_to_external: std.ArrayList(usize),
+
+    // Product Quantization (PQ8) for sub-microsecond approximate distance
+    pq_m: usize, // Number of subvectors (dim / pq_dsub)
+    pq_dsub: usize, // Subvector dimension
+    pq_ksub: usize, // Centroids per subvector (256)
+    pq_codebook: []f32, // Codebook: pq_m * pq_ksub * pq_dsub floats
+    pq_codes: []u8, // Encoded vectors: count * pq_m bytes
+
+    // 4-bit Product Quantization (PQ4) with in-register NEON tbl lookup
+    pq4_m: usize, // Number of subvectors
+    pq4_dsub: usize, // Subvector dimension
+    pq4_codebook: []f32, // Codebook: pq4_m * 16 * pq4_dsub floats
+    pq4_codes: []u8, // Packed nibbles: count * (pq4_m / 2) bytes
 
     pub fn init(
         allocator: mem.Allocator,
@@ -1481,7 +2146,19 @@ pub const VectorDB = struct {
             .ivf_postings_path = null,
             .ivf_postings_is_mmap = false,
             .quantized_vectors = &[_]i8{},
+            .binary_vectors = &[_]u64{},
+            .binary_words_per_vec = (dimension + 63) / 64,
             .storage_file_path = storage_file_path,
+            .internal_to_external = std.ArrayList(usize).init(allocator),
+            .pq_m = 0,
+            .pq_dsub = 0,
+            .pq_ksub = 256,
+            .pq_codebook = &[_]f32{},
+            .pq_codes = &[_]u8{},
+            .pq4_m = 0,
+            .pq4_dsub = 0,
+            .pq4_codebook = &[_]f32{},
+            .pq4_codes = &[_]u8{},
         };
     }
 
@@ -1491,6 +2168,12 @@ pub const VectorDB = struct {
         if (self.ivf_offsets.len > 0) self.allocator.free(self.ivf_offsets);
         if (self.ivf_lengths.len > 0) self.allocator.free(self.ivf_lengths);
         if (self.quantized_vectors.len > 0) self.allocator.free(self.quantized_vectors);
+        if (self.binary_vectors.len > 0) self.allocator.free(self.binary_vectors);
+        if (self.pq_codebook.len > 0) self.allocator.free(self.pq_codebook);
+        if (self.pq_codes.len > 0) self.allocator.free(self.pq_codes);
+        if (self.pq4_codebook.len > 0) self.allocator.free(self.pq4_codebook);
+        if (self.pq4_codes.len > 0) self.allocator.free(self.pq4_codes);
+        self.internal_to_external.deinit();
         if (self.storage_file_path) |path| self.allocator.free(path);
         self.storage.deinit();
         self.index.deinit();
@@ -1562,8 +2245,7 @@ pub const VectorDB = struct {
     }
 
     fn quantizeValue(v: f32) i8 {
-        const scaled = std.math.clamp(v * INT8_SCALE, -INT8_SCALE, INT8_SCALE);
-        return @as(i8, @intFromFloat(@round(scaled)));
+        return VectorOps.quantizeUnit(v);
     }
 
     fn centroidSlice(self: *const VectorDB, centroid_idx: usize) []const f32 {
@@ -1572,13 +2254,13 @@ pub const VectorDB = struct {
         return self.ivf_centroids[offset .. offset + dim];
     }
 
-    fn nearestCentroid(self: *const VectorDB, vector: []const f32) usize {
+    fn nearestCentroid(self: *const VectorDB, vector: []const StorageScalar) usize {
         var best_idx: usize = 0;
         var best_dist: f32 = math.inf(f32);
 
         var c: usize = 0;
         while (c < self.ivf_offsets.len) : (c += 1) {
-            const dist = VectorOps.cosineDistanceFast(vector, self.centroidSlice(c));
+            const dist = VectorOps.cosineDistanceQueryStorage(self.centroidSlice(c), vector);
             if (dist < best_dist) {
                 best_dist = dist;
                 best_idx = c;
@@ -1614,6 +2296,18 @@ pub const VectorDB = struct {
                 self.allocator.free(self.quantized_vectors);
                 self.quantized_vectors = &[_]i8{};
             }
+            if (self.binary_vectors.len > 0) {
+                self.allocator.free(self.binary_vectors);
+                self.binary_vectors = &[_]u64{};
+            }
+            if (self.pq_codebook.len > 0) {
+                self.allocator.free(self.pq_codebook);
+                self.pq_codebook = &[_]f32{};
+            }
+            if (self.pq_codes.len > 0) {
+                self.allocator.free(self.pq_codes);
+                self.pq_codes = &[_]u8{};
+            }
             self.turbo_dirty = false;
             return;
         }
@@ -1646,28 +2340,37 @@ pub const VectorDB = struct {
         for (0..nlist) |c| {
             const sample_idx = (c * count) / nlist;
             const vec = self.storage.getVector(sample_idx);
-            @memcpy(self.ivf_centroids[c * dim ..][0..dim], vec);
+            if (comptime StorageScalar == f32) {
+                @memcpy(self.ivf_centroids[c * dim ..][0..dim], vec);
+            } else {
+                for (vec, 0..) |v, d| {
+                    self.ivf_centroids[c * dim + d] = VectorOps.toF32(v);
+                }
+            }
         }
 
-        // Small-kmeans refinement.
+        // Sampled K-means refinement — use a subset for centroid training (much faster for large n).
+        const sample_size = @min(count, nlist * 40); // ~40 samples per cluster is sufficient
         var sums = try self.allocator.alloc(f32, centroid_len);
         defer self.allocator.free(sums);
         var counts = try self.allocator.alloc(usize, nlist);
         defer self.allocator.free(counts);
 
+        const stride = if (sample_size < count) count / sample_size else 1;
         var iter: usize = 0;
         while (iter < 2) : (iter += 1) {
             @memset(sums, 0.0);
             @memset(counts, 0);
 
-            var i: usize = 0;
-            while (i < count) : (i += 1) {
+            var s: usize = 0;
+            while (s < sample_size) : (s += 1) {
+                const i = (s * stride) % count;
                 const vec = self.storage.getVector(i);
                 const c = self.nearestCentroid(vec);
                 counts[c] += 1;
                 const base = c * dim;
                 for (0..dim) |d| {
-                    sums[base + d] += vec[d];
+                    sums[base + d] += VectorOps.toF32(vec[d]);
                 }
             }
 
@@ -1682,15 +2385,104 @@ pub const VectorDB = struct {
             }
         }
 
-        // Build posting lists.
+        // Single-pass: assign centroids + quantize in one scan over all vectors.
+        // First pass: count cluster sizes (needed for offset computation).
+        var assignments = try self.allocator.alloc(u16, count);
+        defer self.allocator.free(assignments);
         @memset(self.ivf_lengths, 0);
-        var i: usize = 0;
-        while (i < count) : (i += 1) {
-            const vec = self.storage.getVector(i);
-            const c = self.nearestCentroid(vec);
-            self.ivf_lengths[c] += 1;
+
+        // Quantized copy for approximate scoring.
+        const quant_len = count * dim;
+        if (self.quantized_vectors.len != quant_len) {
+            if (self.quantized_vectors.len > 0) self.allocator.free(self.quantized_vectors);
+            self.quantized_vectors = try self.allocator.alloc(i8, quant_len);
         }
 
+        // Binary quantization storage (sign-bit encoding for Hamming pre-filter)
+        const bwords = self.binary_words_per_vec;
+        const bin_len = count * bwords;
+        if (self.binary_vectors.len != bin_len) {
+            if (self.binary_vectors.len > 0) self.allocator.free(self.binary_vectors);
+            self.binary_vectors = try self.allocator.alloc(u64, bin_len);
+        }
+
+        // Parallel fused assignment + quantization + binary encoding (single pass over all vectors).
+        const assign_threads = @max(1, @min(configuredCpuCount(), count / 256));
+        if (assign_threads > 1) {
+            const AssignCtx = struct {
+                db: *const VectorDB,
+                assign_out: []u16,
+                quant_out: []i8,
+                bin_out: []u64,
+                bw: usize,
+                start: usize,
+                end: usize,
+                local_lengths: [IVF_MAX_LISTS]usize,
+
+                fn run(ctx: *@This()) void {
+                    @memset(&ctx.local_lengths, 0);
+                    const d = ctx.db.storage.dimension;
+                    var idx = ctx.start;
+                    while (idx < ctx.end) : (idx += 1) {
+                        const vec = ctx.db.storage.getVector(idx);
+                        const c = ctx.db.nearestCentroid(vec);
+                        ctx.assign_out[idx] = @intCast(c);
+                        ctx.local_lengths[c] += 1;
+                        const dst = ctx.quant_out[idx * d ..][0..d];
+                        for (vec, 0..) |v, dd| {
+                            dst[dd] = quantizeValue(VectorOps.toF32(v));
+                        }
+                        // Binary encode in same pass
+                        VectorOps.binaryEncodeStorage(vec, ctx.bin_out[idx * ctx.bw ..][0..ctx.bw]);
+                    }
+                }
+            };
+
+            var ctxs = try self.allocator.alloc(AssignCtx, assign_threads);
+            defer self.allocator.free(ctxs);
+            var threads = try self.allocator.alloc(std.Thread, assign_threads);
+            defer self.allocator.free(threads);
+
+            const chunk = (count + assign_threads - 1) / assign_threads;
+            for (0..assign_threads) |ti| {
+                ctxs[ti] = .{
+                    .db = self,
+                    .assign_out = assignments,
+                    .quant_out = self.quantized_vectors,
+                    .bin_out = self.binary_vectors,
+                    .bw = bwords,
+                    .start = ti * chunk,
+                    .end = @min((ti + 1) * chunk, count),
+                    .local_lengths = undefined,
+                };
+                threads[ti] = try std.Thread.spawn(.{}, AssignCtx.run, .{&ctxs[ti]});
+            }
+            for (threads) |t| t.join();
+
+            // Merge per-thread lengths
+            @memset(self.ivf_lengths, 0);
+            for (ctxs) |ctx| {
+                for (0..nlist) |c| {
+                    self.ivf_lengths[c] += ctx.local_lengths[c];
+                }
+            }
+        } else {
+            // Single-threaded fallback
+            var i: usize = 0;
+            while (i < count) : (i += 1) {
+                const vec = self.storage.getVector(i);
+                const c = self.nearestCentroid(vec);
+                assignments[i] = @intCast(c);
+                self.ivf_lengths[c] += 1;
+                const dst = self.quantized_vectors[i * dim ..][0..dim];
+                for (vec, 0..) |v, d| {
+                    dst[d] = quantizeValue(VectorOps.toF32(v));
+                }
+                VectorOps.binaryEncodeStorage(vec, self.binary_vectors[i * bwords ..][0..bwords]);
+            }
+        }
+
+        // Build posting lists from cached assignments (no second centroid scan).
         var running: usize = 0;
         for (0..nlist) |c| {
             self.ivf_offsets[c] = running;
@@ -1703,38 +2495,590 @@ pub const VectorDB = struct {
         defer self.allocator.free(cursors);
         @memcpy(cursors, self.ivf_offsets);
 
-        i = 0;
-        while (i < count) : (i += 1) {
-            const vec = self.storage.getVector(i);
-            const c = self.nearestCentroid(vec);
+        for (0..count) |vi| {
+            const c = assignments[vi];
             const write_pos = cursors[c];
-            self.ivf_postings[write_pos] = i;
+            self.ivf_postings[write_pos] = vi;
             cursors[c] += 1;
         }
 
-        // Quantized copy for approximate scoring.
-        const quant_len = count * dim;
-        if (self.quantized_vectors.len != quant_len) {
-            if (self.quantized_vectors.len > 0) self.allocator.free(self.quantized_vectors);
-            self.quantized_vectors = try self.allocator.alloc(i8, quant_len);
+        self.turbo_dirty = false;
+
+        // Build 4-bit PQ for ultra-fast approximate distance filtering
+        try self.buildPQ4();
+
+        // Reorder graph nodes into BFS traversal order for cache-optimal search
+        try self.compactGraphLayout();
+    }
+
+    /// Train PQ codebook using sampled K-means and encode all vectors.
+    fn buildPQ(self: *VectorDB) !void {
+        const dim = self.storage.dimension;
+        const count = self.storage.count;
+        // Only train PQ for large datasets where it amortizes (> 50K vectors)
+        if (count < 50_000 or dim < 8) return;
+
+        // PQ parameters: split into subvectors of 8 dimensions
+        const dsub: usize = 8;
+        const pq_m = dim / dsub;
+        if (pq_m == 0) return;
+        const ksub: usize = 256; // Standard PQ with 1-byte codes
+
+        self.pq_m = pq_m;
+        self.pq_dsub = dsub;
+        self.pq_ksub = ksub;
+
+        // Allocate codebook: pq_m * ksub * dsub floats
+        const cb_len = pq_m * ksub * dsub;
+        if (self.pq_codebook.len != cb_len) {
+            if (self.pq_codebook.len > 0) self.allocator.free(self.pq_codebook);
+            self.pq_codebook = try self.allocator.alloc(f32, cb_len);
         }
 
-        i = 0;
-        while (i < count) : (i += 1) {
-            const vec = self.storage.getVector(i);
-            const dst = self.quantized_vectors[i * dim ..][0..dim];
-            for (vec, 0..) |v, d| {
-                dst[d] = quantizeValue(v);
+        // Allocate PQ codes: count * pq_m bytes
+        const codes_len = count * pq_m;
+        if (self.pq_codes.len != codes_len) {
+            if (self.pq_codes.len > 0) self.allocator.free(self.pq_codes);
+            self.pq_codes = try self.allocator.alloc(u8, codes_len);
+        }
+
+        // Train each subvector's codebook independently using sampled K-means
+        const sample_size = @min(count, ksub * 40);
+        const stride_s = if (sample_size < count) count / sample_size else 1;
+        var sums = try self.allocator.alloc(f32, ksub * dsub);
+        defer self.allocator.free(sums);
+        var kcounts = try self.allocator.alloc(usize, ksub);
+        defer self.allocator.free(kcounts);
+
+        for (0..pq_m) |m| {
+            const sub_offset = m * dsub;
+            const cb_base = m * ksub * dsub;
+
+            // Initialize centroids from evenly spaced samples
+            for (0..ksub) |k| {
+                const vi = (k * count / ksub) % count;
+                const vec = self.storage.getVector(vi);
+                for (0..dsub) |d| {
+                    self.pq_codebook[cb_base + k * dsub + d] = VectorOps.toF32(vec[sub_offset + d]);
+                }
+            }
+
+            // 2 iterations of K-means (sampled)
+            var iter: usize = 0;
+            while (iter < 2) : (iter += 1) {
+                @memset(sums, 0.0);
+                @memset(kcounts, 0);
+
+                var s: usize = 0;
+                while (s < sample_size) : (s += 1) {
+                    const vi = (s * stride_s) % count;
+                    const vec = self.storage.getVector(vi);
+
+                    // Find nearest centroid for this subvector
+                    var best_k: usize = 0;
+                    var best_dist: f32 = std.math.inf(f32);
+                    for (0..ksub) |k| {
+                        var dist: f32 = 0;
+                        for (0..dsub) |d| {
+                            const diff = VectorOps.toF32(vec[sub_offset + d]) - self.pq_codebook[cb_base + k * dsub + d];
+                            dist += diff * diff;
+                        }
+                        if (dist < best_dist) {
+                            best_dist = dist;
+                            best_k = k;
+                        }
+                    }
+
+                    kcounts[best_k] += 1;
+                    for (0..dsub) |d| {
+                        sums[best_k * dsub + d] += VectorOps.toF32(vec[sub_offset + d]);
+                    }
+                }
+
+                // Update centroids
+                for (0..ksub) |k| {
+                    if (kcounts[k] == 0) continue;
+                    const inv = 1.0 / @as(f32, @floatFromInt(kcounts[k]));
+                    for (0..dsub) |d| {
+                        self.pq_codebook[cb_base + k * dsub + d] = sums[k * dsub + d] * inv;
+                    }
+                }
             }
         }
 
-        self.turbo_dirty = false;
+        // Encode all vectors: assign each subvector to nearest centroid
+        for (0..count) |vi| {
+            const vec = self.storage.getVector(vi);
+            for (0..pq_m) |m| {
+                const sub_offset = m * dsub;
+                const cb_base = m * ksub * dsub;
+                var best_k: u8 = 0;
+                var best_dist: f32 = std.math.inf(f32);
+                for (0..ksub) |k| {
+                    var dist: f32 = 0;
+                    for (0..dsub) |d| {
+                        const diff = VectorOps.toF32(vec[sub_offset + d]) - self.pq_codebook[cb_base + k * dsub + d];
+                        dist += diff * diff;
+                    }
+                    if (dist < best_dist) {
+                        best_dist = dist;
+                        best_k = @intCast(k);
+                    }
+                }
+                self.pq_codes[vi * pq_m + m] = best_k;
+            }
+        }
+    }
+
+    /// Compute asymmetric PQ distance from pre-computed distance table.
+    /// Returns approximate squared L2 distance.
+    inline fn pqDistanceADC(self: *const VectorDB, dist_table: []const f32, vec_idx: usize) f32 {
+        const pq_m = self.pq_m;
+        const codes = self.pq_codes[vec_idx * pq_m ..][0..pq_m];
+        var dist: f32 = 0;
+        // Process 4 subvectors at a time for ILP
+        const aligned = pq_m - (pq_m % 4);
+        var m: usize = 0;
+        while (m < aligned) : (m += 4) {
+            dist += dist_table[m * self.pq_ksub + codes[m]];
+            dist += dist_table[(m + 1) * self.pq_ksub + codes[m + 1]];
+            dist += dist_table[(m + 2) * self.pq_ksub + codes[m + 2]];
+            dist += dist_table[(m + 3) * self.pq_ksub + codes[m + 3]];
+        }
+        while (m < pq_m) : (m += 1) {
+            dist += dist_table[m * self.pq_ksub + codes[m]];
+        }
+        return dist;
+    }
+
+    /// Build the ADC distance table from a query vector.
+    /// For each subvector m and centroid k, compute ||query_sub - centroid||^2.
+    fn buildPQDistTable(self: *const VectorDB, query: []const f32, table: []f32) void {
+        const pq_m = self.pq_m;
+        const dsub = self.pq_dsub;
+        const ksub = self.pq_ksub;
+        for (0..pq_m) |m| {
+            const sub_offset = m * dsub;
+            const cb_base = m * ksub * dsub;
+            for (0..ksub) |k| {
+                var dist: f32 = 0;
+                for (0..dsub) |d| {
+                    const diff = query[sub_offset + d] - self.pq_codebook[cb_base + k * dsub + d];
+                    dist += diff * diff;
+                }
+                table[m * ksub + k] = dist;
+            }
+        }
+    }
+
+    // ── 4-bit Product Quantization (PQ4) with in-register NEON tbl ──
+
+    /// Train PQ4 codebook (K=16 per subvector) and encode all vectors as packed nibbles.
+    fn buildPQ4(self: *VectorDB) !void {
+        const dim = self.storage.dimension;
+        const count = self.storage.count;
+        if (count < self.ivf_min_vectors or dim < 8) return;
+
+        const dsub: usize = 8;
+        const pq4_m = dim / dsub;
+        if (pq4_m < 2) return; // Need at least 2 subvectors for nibble packing
+        const ksub: usize = 16; // 4-bit codes
+
+        self.pq4_m = pq4_m;
+        self.pq4_dsub = dsub;
+
+        // Allocate codebook: pq4_m * 16 * dsub floats
+        const cb_len = pq4_m * ksub * dsub;
+        if (self.pq4_codebook.len != cb_len) {
+            if (self.pq4_codebook.len > 0) self.allocator.free(self.pq4_codebook);
+            self.pq4_codebook = try self.allocator.alloc(f32, cb_len);
+        }
+
+        // Allocate packed codes: count * (pq4_m / 2) bytes (2 codes per byte)
+        const codes_len = count * (pq4_m / 2);
+        if (self.pq4_codes.len != codes_len) {
+            if (self.pq4_codes.len > 0) self.allocator.free(self.pq4_codes);
+            self.pq4_codes = try self.allocator.alloc(u8, codes_len);
+        }
+
+        // Train each subvector codebook with sampled K-means (K=16)
+        const sample_size = @min(count, ksub * 40);
+        const stride_s = if (sample_size < count) count / sample_size else 1;
+        var sums = try self.allocator.alloc(f32, ksub * dsub);
+        defer self.allocator.free(sums);
+        var kcounts = try self.allocator.alloc(usize, ksub);
+        defer self.allocator.free(kcounts);
+
+        for (0..pq4_m) |m| {
+            const sub_offset = m * dsub;
+            const cb_base = m * ksub * dsub;
+
+            // Initialize centroids from evenly spaced samples
+            for (0..ksub) |k| {
+                const vi = (k * count / ksub) % count;
+                const vec = self.storage.getVector(vi);
+                for (0..dsub) |d| {
+                    self.pq4_codebook[cb_base + k * dsub + d] = VectorOps.toF32(vec[sub_offset + d]);
+                }
+            }
+
+            // 3 iterations of K-means (more iterations for fewer centroids)
+            for (0..3) |_| {
+                @memset(sums, 0.0);
+                @memset(kcounts, 0);
+
+                var s: usize = 0;
+                while (s < sample_size) : (s += 1) {
+                    const vi = (s * stride_s) % count;
+                    const vec = self.storage.getVector(vi);
+                    var best_k: usize = 0;
+                    var best_dist: f32 = std.math.inf(f32);
+                    for (0..ksub) |k| {
+                        var dist: f32 = 0;
+                        for (0..dsub) |d| {
+                            const diff = VectorOps.toF32(vec[sub_offset + d]) - self.pq4_codebook[cb_base + k * dsub + d];
+                            dist += diff * diff;
+                        }
+                        if (dist < best_dist) {
+                            best_dist = dist;
+                            best_k = k;
+                        }
+                    }
+                    kcounts[best_k] += 1;
+                    for (0..dsub) |d| {
+                        sums[best_k * dsub + d] += VectorOps.toF32(vec[sub_offset + d]);
+                    }
+                }
+
+                for (0..ksub) |k| {
+                    if (kcounts[k] == 0) continue;
+                    const inv = 1.0 / @as(f32, @floatFromInt(kcounts[k]));
+                    for (0..dsub) |d| {
+                        self.pq4_codebook[cb_base + k * dsub + d] = sums[k * dsub + d] * inv;
+                    }
+                }
+            }
+        }
+
+        // Encode all vectors as packed nibbles (2 codes per byte)
+        const half_m = pq4_m / 2;
+        for (0..count) |vi| {
+            const vec = self.storage.getVector(vi);
+            var m: usize = 0;
+            while (m < pq4_m - 1) : (m += 2) {
+                const code_lo = pq4FindNearest(self.pq4_codebook, m, dsub, ksub, vec);
+                const code_hi = pq4FindNearest(self.pq4_codebook, m + 1, dsub, ksub, vec);
+                self.pq4_codes[vi * half_m + m / 2] = code_lo | (code_hi << 4);
+            }
+            // Handle odd pq4_m
+            if (pq4_m % 2 == 1) {
+                const code_lo = pq4FindNearest(self.pq4_codebook, pq4_m - 1, dsub, ksub, vec);
+                self.pq4_codes[vi * half_m + half_m - 1] = code_lo;
+            }
+        }
+    }
+
+    fn pq4FindNearest(codebook: []const f32, m: usize, dsub: usize, ksub: usize, vec: []const StorageScalar) u8 {
+        const sub_offset = m * dsub;
+        const cb_base = m * ksub * dsub;
+        var best_k: u8 = 0;
+        var best_dist: f32 = std.math.inf(f32);
+        for (0..ksub) |k| {
+            var dist: f32 = 0;
+            for (0..dsub) |d| {
+                const diff = VectorOps.toF32(vec[sub_offset + d]) - codebook[cb_base + k * dsub + d];
+                dist += diff * diff;
+            }
+            if (dist < best_dist) {
+                best_dist = dist;
+                best_k = @intCast(k);
+            }
+        }
+        return best_k;
+    }
+
+    /// Build u8 quantized distance table for PQ4 ADC.
+    /// For each subvector m, computes distance from query to all 16 centroids,
+    /// then quantizes to u8. Returns the scale factor for converting back to f32.
+    fn pq4BuildDistTable(self: *const VectorDB, query: []const f32, table: []u8) f32 {
+        const pq4_m = self.pq4_m;
+        const dsub = self.pq4_dsub;
+        const ksub: usize = 16;
+
+        // First pass: compute f32 distances and find global max
+        var max_dist: f32 = 0;
+        for (0..pq4_m) |m| {
+            const sub_offset = m * dsub;
+            const cb_base = m * ksub * dsub;
+            for (0..ksub) |k| {
+                var dist: f32 = 0;
+                for (0..dsub) |d| {
+                    const diff = query[sub_offset + d] - self.pq4_codebook[cb_base + k * dsub + d];
+                    dist += diff * diff;
+                }
+                if (dist > max_dist) max_dist = dist;
+            }
+        }
+
+        // Quantize to u8 with scale
+        const scale = if (max_dist > 0) 255.0 / max_dist else 1.0;
+        for (0..pq4_m) |m| {
+            const sub_offset = m * dsub;
+            const cb_base = m * ksub * dsub;
+            for (0..ksub) |k| {
+                var dist: f32 = 0;
+                for (0..dsub) |d| {
+                    const diff = query[sub_offset + d] - self.pq4_codebook[cb_base + k * dsub + d];
+                    dist += diff * diff;
+                }
+                table[m * ksub + k] = @intFromFloat(@min(255.0, dist * scale));
+            }
+        }
+
+        return if (scale > 0) 1.0 / scale else 1.0;
+    }
+
+    /// PQ4 asymmetric distance using NEON tbl in-register lookup.
+    /// Each subvector's 16-entry u8 table fits in one 128-bit register.
+    /// The 4-bit codes index directly into the table via tbl instruction.
+    inline fn pq4DistanceADC(self: *const VectorDB, dist_table: []const u8, vec_idx: usize) u32 {
+        const pq4_m = self.pq4_m;
+        const half_m = pq4_m / 2;
+        const codes = self.pq4_codes[vec_idx * half_m ..][0..half_m];
+
+        if (comptime builtin.cpu.arch == .aarch64) {
+            return pq4DistanceNeon(dist_table, codes, pq4_m);
+        }
+        return pq4DistanceGeneric(dist_table, codes, pq4_m);
+    }
+
+    fn pq4DistanceNeon(dist_table: []const u8, codes: []const u8, pq4_m: usize) u32 {
+        const half_m = pq4_m / 2;
+        var sum: u32 = 0;
+
+        // Process 2 subvectors at a time (1 byte = 2 packed nibbles)
+        for (0..half_m) |i| {
+            const byte = codes[i];
+            const code_lo: u8 = byte & 0x0F;
+            const code_hi: u8 = byte >> 4;
+            const m_lo = i * 2;
+            const m_hi = m_lo + 1;
+
+            // Load 16-byte distance tables into NEON registers
+            const table_lo: @Vector(16, u8) = dist_table[m_lo * 16 ..][0..16].*;
+            const table_hi: @Vector(16, u8) = dist_table[m_hi * 16 ..][0..16].*;
+
+            // Use tbl for in-register lookup (index vector with single code byte)
+            var idx_lo: @Vector(16, u8) = @splat(0xFF); // Invalid indices → 0 output
+            idx_lo[0] = code_lo;
+            var idx_hi: @Vector(16, u8) = @splat(0xFF);
+            idx_hi[0] = code_hi;
+
+            // ARM tbl: lookup table_lo[idx_lo[i]] for each i
+            // Indices >= 16 return 0, so only slot 0 has a valid result
+            const result_lo = asm ("tbl %[d].16b, {%[n].16b}, %[m].16b"
+                : [d] "=w" (-> @Vector(16, u8))
+                : [n] "w" (table_lo), [m] "w" (idx_lo),
+            );
+            const result_hi = asm ("tbl %[d].16b, {%[n].16b}, %[m].16b"
+                : [d] "=w" (-> @Vector(16, u8))
+                : [n] "w" (table_hi), [m] "w" (idx_hi),
+            );
+
+            sum += @as(u32, result_lo[0]) + @as(u32, result_hi[0]);
+        }
+
+        // Handle odd subvector count
+        if (pq4_m % 2 == 1) {
+            const last_m = pq4_m - 1;
+            const byte = codes[half_m - 1];
+            const code: u8 = byte & 0x0F;
+            sum += dist_table[last_m * 16 + code];
+        }
+
+        return sum;
+    }
+
+    fn pq4DistanceGeneric(dist_table: []const u8, codes: []const u8, pq4_m: usize) u32 {
+        const half_m = pq4_m / 2;
+        var sum: u32 = 0;
+
+        for (0..half_m) |i| {
+            const byte = codes[i];
+            const code_lo: u8 = byte & 0x0F;
+            const code_hi: u8 = byte >> 4;
+            sum += dist_table[i * 2 * 16 + code_lo];
+            sum += dist_table[(i * 2 + 1) * 16 + code_hi];
+        }
+
+        if (pq4_m % 2 == 1) {
+            const last_m = pq4_m - 1;
+            const byte = codes[half_m - 1];
+            sum += dist_table[last_m * 16 + (byte & 0x0F)];
+        }
+
+        return sum;
+    }
+
+    /// Reorder nodes, vectors, and auxiliary data into BFS traversal order.
+    /// After reordering, a node's graph neighbors tend to be physically adjacent
+    /// in memory, dramatically reducing cache misses during HNSW search.
+    fn compactGraphLayout(self: *VectorDB) !void {
+        const n = self.storage.count;
+        if (n < 2 or self.index.entry_point == null) return;
+
+        // ── Step 1: BFS from entry point to determine new ordering ──
+        var order = try self.allocator.alloc(usize, n);
+        defer self.allocator.free(order);
+        var new_id = try self.allocator.alloc(usize, n);
+        defer self.allocator.free(new_id);
+        var visited = try self.allocator.alloc(bool, n);
+        defer self.allocator.free(visited);
+        @memset(visited, false);
+
+        var head: usize = 0;
+        var tail: usize = 0;
+        order[tail] = self.index.entry_point.?;
+        visited[self.index.entry_point.?] = true;
+        tail += 1;
+
+        while (head < tail) {
+            const old = order[head];
+            head += 1;
+            const conns = self.index.getConnections(old, 0);
+            for (conns) |neighbor| {
+                if (!visited[neighbor]) {
+                    visited[neighbor] = true;
+                    order[tail] = neighbor;
+                    tail += 1;
+                }
+            }
+        }
+        // Disconnected nodes
+        for (0..n) |i| {
+            if (!visited[i]) {
+                order[tail] = i;
+                tail += 1;
+            }
+        }
+
+        // Reverse mapping: old_id -> new_id
+        for (order, 0..) |old, idx| {
+            new_id[old] = idx;
+        }
+
+        // Check if already well-ordered (skip expensive copy)
+        var already_ordered = true;
+        for (order, 0..) |old, idx| {
+            if (old != idx) {
+                already_ordered = false;
+                break;
+            }
+        }
+        if (already_ordered) return;
+
+        // ── Step 2: Remap entry point ──
+        self.index.entry_point = new_id[self.index.entry_point.?];
+
+        // ── Step 3: Remap all edge targets (only active connections) ──
+        for (self.index.nodes.items[0..n]) |node| {
+            for (node.connections) |conn| {
+                if (conn.len == 0) continue;
+                const edges = self.index.edge_pool.items[conn.offset..][0..conn.len];
+                for (edges) |*edge| {
+                    edge.* = new_id[edge.*];
+                }
+            }
+        }
+
+        // ── Step 4: Reorder nodes ──
+        {
+            var new_nodes = try self.allocator.alloc(HNSWIndex.Node, n);
+            defer self.allocator.free(new_nodes);
+            for (order, 0..) |old, idx| {
+                new_nodes[idx] = self.index.nodes.items[old];
+            }
+            @memcpy(self.index.nodes.items[0..n], new_nodes);
+        }
+
+        // ── Step 5: Reorder vectors in storage ──
+        {
+            const vec_size = self.storage.dimension * @sizeOf(StorageScalar);
+            var vec_copy = try self.allocator.alloc(u8, n * vec_size);
+            defer self.allocator.free(vec_copy);
+            for (order, 0..) |old, idx| {
+                @memcpy(vec_copy[idx * vec_size ..][0..vec_size], self.storage.getVectorBytes(old));
+            }
+            for (0..n) |idx| {
+                @memcpy(self.storage.getVectorBytesMut(idx), vec_copy[idx * vec_size ..][0..vec_size]);
+            }
+        }
+
+        // ── Step 6: Reorder quantized vectors ──
+        if (self.quantized_vectors.len > 0) {
+            const dim = self.storage.dimension;
+            var qv_copy = try self.allocator.alloc(i8, self.quantized_vectors.len);
+            defer self.allocator.free(qv_copy);
+            for (order, 0..) |old, idx| {
+                @memcpy(qv_copy[idx * dim ..][0..dim], self.quantized_vectors[old * dim ..][0..dim]);
+            }
+            @memcpy(self.quantized_vectors, qv_copy);
+        }
+
+        // ── Step 7: Reorder binary vectors ──
+        if (self.binary_vectors.len > 0) {
+            const bw = self.binary_words_per_vec;
+            var bv_copy = try self.allocator.alloc(u64, self.binary_vectors.len);
+            defer self.allocator.free(bv_copy);
+            for (order, 0..) |old, idx| {
+                @memcpy(bv_copy[idx * bw ..][0..bw], self.binary_vectors[old * bw ..][0..bw]);
+            }
+            @memcpy(self.binary_vectors, bv_copy);
+        }
+
+        // ── Step 8: Reorder PQ codes ──
+        if (self.pq_codes.len > 0) {
+            const pm = self.pq_m;
+            var pq_copy = try self.allocator.alloc(u8, self.pq_codes.len);
+            defer self.allocator.free(pq_copy);
+            for (order, 0..) |old, idx| {
+                @memcpy(pq_copy[idx * pm ..][0..pm], self.pq_codes[old * pm ..][0..pm]);
+            }
+            @memcpy(self.pq_codes, pq_copy);
+        }
+
+        // ── Step 8b: Reorder PQ4 codes ──
+        if (self.pq4_codes.len > 0) {
+            const half_m = self.pq4_m / 2;
+            var pq4_copy = try self.allocator.alloc(u8, self.pq4_codes.len);
+            defer self.allocator.free(pq4_copy);
+            for (order, 0..) |old, idx| {
+                @memcpy(pq4_copy[idx * half_m ..][0..half_m], self.pq4_codes[old * half_m ..][0..half_m]);
+            }
+            @memcpy(self.pq4_codes, pq4_copy);
+        }
+
+        // ── Step 9: Remap IVF postings ──
+        for (self.ivf_postings) |*posting| {
+            if (posting.* < n) posting.* = new_id[posting.*];
+        }
+
+        // ── Step 10: Reorder internal→external ID mapping ──
+        if (self.internal_to_external.items.len >= n) {
+            var ext_copy = try self.allocator.alloc(usize, n);
+            defer self.allocator.free(ext_copy);
+            for (order, 0..) |old, new_idx| {
+                ext_copy[new_idx] = self.internal_to_external.items[old];
+            }
+            @memcpy(self.internal_to_external.items[0..n], ext_copy);
+        }
     }
 
     pub fn addVector(self: *VectorDB, vector: []const f32, metadata: ?std.json.Value) !usize {
         if (vector.len != self.storage.dimension) return error.InvalidDimension;
 
         const idx = try self.storage.addVector(vector);
+        try self.internal_to_external.append(idx);
         try self.index.insert(idx, &self.storage);
         self.turbo_dirty = true;
 
@@ -1743,6 +3087,13 @@ pub const VectorDB = struct {
         }
 
         return idx;
+    }
+
+    inline fn resultVectorSlice(self: *VectorDB, idx: usize) []const f32 {
+        if (comptime StorageScalar == f32) {
+            return self.storage.getVector(idx);
+        }
+        return &[_]f32{};
     }
 
     fn searchBruteForce(self: *VectorDB, normalized_query: []const f32, k: usize) ![]SearchResult {
@@ -1756,14 +3107,13 @@ pub const VectorDB = struct {
 
         var idx: usize = 0;
         while (idx < self.storage.count) : (idx += 1) {
-            const vec = self.storage.getVector(idx);
-            const dist = VectorOps.cosineDistanceFast(normalized_query, vec);
+            const dist = VectorOps.cosineDistanceQueryStorage(normalized_query, self.storage.getVector(idx));
 
             if (filled < result_len) {
                 results[filled] = .{
                     .idx = idx,
                     .distance = dist,
-                    .vector = vec,
+                    .vector = self.resultVectorSlice(idx),
                 };
                 if (dist > worst_dist) {
                     worst_dist = dist;
@@ -1778,7 +3128,7 @@ pub const VectorDB = struct {
             results[worst_pos] = .{
                 .idx = idx,
                 .distance = dist,
-                .vector = vec,
+                .vector = self.resultVectorSlice(idx),
             };
 
             worst_pos = 0;
@@ -1807,23 +3157,19 @@ pub const VectorDB = struct {
             return try self.allocator.alloc(SearchResult, 0);
         }
 
-        const ef = @max(k * 8, self.search_ef);
+        const ef = @max(k * 4, self.search_ef);
         self.index.build_rwlock.lockShared();
         defer self.index.build_rwlock.unlockShared();
-        const candidates = try self.index.searchLayer(normalized_query, self.index.entry_point.?, ef, 0, &self.storage);
-        defer candidates.deinit();
+        const items = try self.index.searchLayer(normalized_query, self.index.entry_point.?, ef, 0, &self.storage);
+        // items is a slice into context buffer – no deallocation needed
 
-        var results = try self.allocator.alloc(SearchResult, @min(k, candidates.items.len));
-        for (candidates.items[0..results.len], 0..) |idx, i| {
-            const vec = self.storage.getVector(idx);
-            if (i + 1 < results.len) {
-                const next_vec = self.storage.getVector(candidates.items[i + 1]);
-                @prefetch(next_vec.ptr, .{ .rw = .read, .locality = 2, .cache = .data });
-            }
+        const result_len = @min(k, items.len);
+        var results = try self.allocator.alloc(SearchResult, result_len);
+        for (items[0..result_len], 0..) |item, i| {
             results[i] = .{
-                .idx = idx,
-                .distance = VectorOps.cosineDistanceFast(normalized_query, vec),
-                .vector = vec,
+                .idx = item.idx,
+                .distance = item.distance, // already computed – no recomputation!
+                .vector = self.resultVectorSlice(item.idx),
             };
         }
 
@@ -1842,16 +3188,32 @@ pub const VectorDB = struct {
         };
 
         const nlist = self.ivf_offsets.len;
-        const probes = std.math.clamp(@max(self.ivf_probes, self.search_ef / 64), 1, nlist);
+        // Adaptive probe scaling: aggressive probing only when user demands high recall.
+        // Low ef = throughput mode (few probes), high ef = recall mode (many probes).
+        // IVF probing is cheap (int8) vs HNSW assist (f32), so probe aggressively.
+        const adaptive_probes = if (self.search_ef >= 256)
+            self.search_ef / 5
+        else
+            self.search_ef / 32;
+        const probes = std.math.clamp(@max(self.ivf_probes, adaptive_probes), 1, nlist);
         if (probes == 0) return self.searchHnsw(normalized_query, k);
 
-        var probe_lists = try self.allocator.alloc(ProbeCandidate, probes);
-        defer self.allocator.free(probe_lists);
+        // Stack buffer for probe lists (max 512 probes × 12 bytes = 6KB)
+        var probe_lists_stack: [IVF_MAX_LISTS]ProbeCandidate = undefined;
+        const probe_lists = probe_lists_stack[0..probes];
         var probe_len: usize = 0;
         var probe_worst_pos: usize = 0;
         var probe_worst_dist: f32 = -std.math.inf(f32);
 
+        // Prefetch first centroid
+        if (nlist > 0) {
+            @prefetch(@as([*]const u8, @ptrCast(self.centroidSlice(0).ptr)), .{ .rw = .read, .locality = 1, .cache = .data });
+        }
         for (0..nlist) |c| {
+            // Prefetch next centroid while processing current
+            if (c + 1 < nlist) {
+                @prefetch(@as([*]const u8, @ptrCast(self.centroidSlice(c + 1).ptr)), .{ .rw = .read, .locality = 1, .cache = .data });
+            }
             const dist = VectorOps.cosineDistanceFast(normalized_query, self.centroidSlice(c));
             if (probe_len < probes) {
                 probe_lists[probe_len] = .{ .idx = c, .distance = dist };
@@ -1899,11 +3261,172 @@ pub const VectorDB = struct {
             try self.allocator.alloc(i8, normalized_query.len);
         defer if (normalized_query.len > query_q8_stack.len) self.allocator.free(query_q8);
 
-        for (normalized_query, 0..) |v, i| {
-            query_q8[i] = quantizeValue(v);
+        VectorOps.quantizeBatch(normalized_query, query_q8);
+
+        // Binary-encode query for Hamming pre-filter
+        const bwords = self.binary_words_per_vec;
+        var query_bin_stack: [32]u64 = undefined; // Supports up to 2048d
+        const query_bin = if (bwords <= query_bin_stack.len)
+            query_bin_stack[0..bwords]
+        else
+            try self.allocator.alloc(u64, bwords);
+        defer if (bwords > query_bin_stack.len) self.allocator.free(query_bin);
+        VectorOps.binaryEncode(normalized_query, query_bin);
+        const has_binary = self.binary_vectors.len > 0;
+
+        // Build PQ4 distance table for ultra-fast approximate filtering
+        const has_pq4 = self.pq4_codes.len > 0 and self.pq4_m > 0;
+        var pq4_table_stack: [1536]u8 = undefined; // 96 subvecs × 16 entries
+        const pq4_table_size = if (has_pq4) self.pq4_m * 16 else @as(usize, 0);
+        var pq4_table_heap: []u8 = &[_]u8{};
+        if (has_pq4 and pq4_table_size > pq4_table_stack.len) {
+            pq4_table_heap = try self.allocator.alloc(u8, pq4_table_size);
+        }
+        defer if (pq4_table_heap.len > 0) self.allocator.free(pq4_table_heap);
+        const pq4_table: []u8 = if (has_pq4) (if (pq4_table_size <= pq4_table_stack.len) pq4_table_stack[0..pq4_table_size] else pq4_table_heap) else pq4_table_heap;
+        var pq4_inv_scale: f32 = 1.0;
+        if (has_pq4) {
+            pq4_inv_scale = self.pq4BuildDistTable(normalized_query, pq4_table);
         }
 
-        const thread_count = @max(1, @min(std.Thread.getCpuCount() catch 1, probe_len));
+        // HNSW assist for high-recall mode — the graph catches what IVF misses
+        const use_hnsw_assist = self.search_ef >= 256 and self.index.entry_point != null;
+        const use_threads = total_candidates >= 50_000;
+
+        // ── Fast single-threaded path: fused IVF scan + rerank (zero intermediate alloc) ──
+        if (!use_threads and !use_hnsw_assist) {
+            const dim = self.storage.dimension;
+            const heap_k = @min(k, total_candidates);
+            var heap_buf: [64]SearchResult = undefined;
+            const heap = if (heap_k <= 64) heap_buf[0..heap_k] else try self.allocator.alloc(SearchResult, heap_k);
+            defer if (heap_k > 64) self.allocator.free(heap);
+            var heap_len: usize = 0;
+            var threshold: f32 = std.math.inf(f32);
+
+            // Margin for int8 quantization error: empirically ~0.05 at 768d
+            const INT8_MARGIN: f32 = 0.08;
+            // Hamming pre-filter: adapted from current cosine threshold.
+            // Relationship: hamming ≈ dim * arccos(1 - cos_dist) / π + margin
+            // We use a generous margin (1.3x) to avoid false rejections.
+            const dim_f: f32 = @floatFromInt(dim);
+            const hamming_max: u32 = @intCast(dim / 2); // random baseline
+            var hamming_reject: u32 = hamming_max;
+
+            for (probe_lists[0..probe_len]) |probe| {
+                const offset = self.ivf_offsets[probe.idx];
+                const list_len = self.ivf_lengths[probe.idx];
+
+                // Prefetch first few quantized vectors ahead of the scan
+                const PF_DEPTH = 4;
+                for (0..@min(PF_DEPTH, list_len)) |pf| {
+                    const pf_idx = self.ivf_postings[offset + pf];
+                    @prefetch(self.quantized_vectors.ptr + pf_idx * dim, .{ .rw = .read, .locality = 1, .cache = .data });
+                }
+
+                var j: usize = 0;
+                while (j < list_len) : (j += 1) {
+                    // Prefetch quantized vector PF_DEPTH positions ahead
+                    if (j + PF_DEPTH < list_len) {
+                        const ahead_idx = self.ivf_postings[offset + j + PF_DEPTH];
+                        @prefetch(self.quantized_vectors.ptr + ahead_idx * dim, .{ .rw = .read, .locality = 1, .cache = .data });
+                    }
+
+                    const idx = self.ivf_postings[offset + j];
+
+                    // Level 0: Binary Hamming pre-filter (ultra-cheap: ~12 XOR + popcount)
+                    if (has_binary and heap_len >= heap_k and threshold < 0.6) {
+                        const bvec = self.binary_vectors[idx * bwords ..][0..bwords];
+                        const hamming = VectorOps.hammingDistance(query_bin, bvec);
+                        if (hamming > hamming_reject) continue;
+                    }
+
+                    // Level 0.5: PQ4 approximate distance (96 table lookups vs 768 int8 ops)
+                    if (has_pq4 and heap_len >= heap_k) {
+                        const pq4_raw = self.pq4DistanceADC(pq4_table, idx);
+                        const pq4_dist = @as(f32, @floatFromInt(pq4_raw)) * pq4_inv_scale;
+                        // PQ4 returns squared L2; convert to approximate cosine: dist ≈ pq4_l2 * 0.5
+                        if (pq4_dist * 0.5 > threshold + 0.15) continue;
+                    }
+
+                    const qvec = self.quantized_vectors[idx * dim ..][0..dim];
+
+                    // Level 1: int8 approximate distance (fast rejection)
+                    const dot_i32 = VectorOps.dotI8(query_q8, qvec);
+                    const approx_dist = 1.0 - @as(f32, @floatFromInt(dot_i32)) * INT8_INV_SCALE_SQ;
+
+                    if (heap_len >= heap_k and approx_dist > threshold + INT8_MARGIN) continue;
+
+                    // Level 2: exact f32 distance (only for promising candidates)
+                    // Prefetch next storage vector for reranking
+                    if (j + 1 < list_len) {
+                        const next_idx = self.ivf_postings[offset + j + 1];
+                        const next_vec = self.storage.getVector(next_idx);
+                        @prefetch(next_vec.ptr, .{ .rw = .read, .locality = 0, .cache = .data });
+                    }
+                    const dist = VectorOps.cosineDistanceQueryStorage(normalized_query, self.storage.getVector(idx));
+
+                    if (heap_len < heap_k) {
+                        heap[heap_len] = .{ .idx = idx, .distance = dist, .vector = self.resultVectorSlice(idx) };
+                        var pos = heap_len;
+                        while (pos > 0) {
+                            const parent = (pos - 1) / 2;
+                            if (heap[pos].distance > heap[parent].distance) {
+                                const tmp = heap[pos];
+                                heap[pos] = heap[parent];
+                                heap[parent] = tmp;
+                                pos = parent;
+                            } else break;
+                        }
+                        heap_len += 1;
+                        if (heap_len == heap_k) {
+                            threshold = heap[0].distance;
+                            // Update adaptive Hamming threshold: arccos(1-d)/π * dim * 1.3 margin
+                            const cos_sim = std.math.clamp(1.0 - threshold, -1.0, 1.0);
+                            const angle = std.math.acos(cos_sim);
+                            hamming_reject = @min(hamming_max, @as(u32, @intFromFloat(angle / std.math.pi * dim_f * 1.3)));
+                        }
+                    } else if (dist < heap[0].distance) {
+                        heap[0] = .{ .idx = idx, .distance = dist, .vector = self.resultVectorSlice(idx) };
+                        var pos: usize = 0;
+                        while (true) {
+                            const left = 2 * pos + 1;
+                            const right = 2 * pos + 2;
+                            var largest = pos;
+                            if (left < heap_len and heap[left].distance > heap[largest].distance) largest = left;
+                            if (right < heap_len and heap[right].distance > heap[largest].distance) largest = right;
+                            if (largest == pos) break;
+                            const tmp = heap[pos];
+                            heap[pos] = heap[largest];
+                            heap[largest] = tmp;
+                            pos = largest;
+                        }
+                        threshold = heap[0].distance;
+                        const cos_sim = std.math.clamp(1.0 - threshold, -1.0, 1.0);
+                        const angle = std.math.acos(cos_sim);
+                        hamming_reject = @min(hamming_max, @as(u32, @intFromFloat(angle / std.math.pi * dim_f * 1.3)));
+                    }
+                }
+            }
+
+            if (heap_len == 0) return self.searchHnsw(normalized_query, k);
+
+            std.sort.heap(SearchResult, heap[0..heap_len], {}, struct {
+                fn lessThan(context: void, a: SearchResult, b: SearchResult) bool {
+                    _ = context;
+                    return a.distance < b.distance;
+                }
+            }.lessThan);
+
+            const out = try self.allocator.alloc(SearchResult, heap_len);
+            @memcpy(out, heap[0..heap_len]);
+            return out;
+        }
+
+        // ── Multi-threaded / HNSW-assist path ──
+        const thread_count = if (use_threads)
+            @max(1, @min(configuredCpuCount(), probe_len))
+        else
+            1;
         const chunk_size = (probe_len + thread_count - 1) / thread_count;
 
         var local_buffers = try self.allocator.alloc([]ApproxCandidate, thread_count);
@@ -1916,16 +3439,9 @@ pub const VectorDB = struct {
         defer self.allocator.free(local_lens);
         @memset(local_lens, 0);
 
-        var chunk_starts = try self.allocator.alloc(usize, thread_count);
-        defer self.allocator.free(chunk_starts);
-        var chunk_ends = try self.allocator.alloc(usize, thread_count);
-        defer self.allocator.free(chunk_ends);
-
         for (0..thread_count) |i| {
             const start = i * chunk_size;
             const end = @min(start + chunk_size, probe_len);
-            chunk_starts[i] = start;
-            chunk_ends[i] = end;
 
             var cap: usize = 0;
             if (start < end) {
@@ -1936,7 +3452,7 @@ pub const VectorDB = struct {
             local_buffers[i] = try self.allocator.alloc(ApproxCandidate, cap);
         }
 
-        const Context = struct {
+        const ScanContext = struct {
             db: *const VectorDB,
             probes: []const ProbeCandidate,
             query_q8: []const i8,
@@ -1957,19 +3473,13 @@ pub const VectorDB = struct {
                     var j: usize = 0;
                     while (j < list_len) : (j += 1) {
                         const idx = ctx.db.ivf_postings[offset + j];
-                        const qvec = ctx.db.quantized_vectors[idx * dim ..][0..dim];
-
-                        var dot_i32: i32 = 0;
-                        for (ctx.query_q8, qvec) |qv, vv| {
-                            dot_i32 += @as(i32, @intCast(qv)) * @as(i32, @intCast(vv));
-                        }
-
-                        const approx_dist = 1.0 - @as(f32, @floatFromInt(dot_i32)) * INT8_INV_SCALE_SQ;
-                        if (len >= ctx.out.len) continue;
-                        ctx.out[len] = .{
-                            .idx = idx,
-                            .approx_distance = approx_dist,
+                        const approx_dist = blk: {
+                            const qvec = ctx.db.quantized_vectors[idx * dim ..][0..dim];
+                            const dot_i32 = VectorOps.dotI8(ctx.query_q8, qvec);
+                            break :blk 1.0 - @as(f32, @floatFromInt(dot_i32)) * INT8_INV_SCALE_SQ;
                         };
+                        if (len >= ctx.out.len) continue;
+                        ctx.out[len] = .{ .idx = idx, .approx_distance = approx_dist };
                         len += 1;
                     }
                 }
@@ -1983,94 +3493,146 @@ pub const VectorDB = struct {
             defer self.allocator.free(threads);
 
             for (threads, 0..) |*thread, i| {
-                const ctx = Context{
+                const start = i * chunk_size;
+                const end = @min(start + chunk_size, probe_len);
+                const ctx = ScanContext{
                     .db = self,
                     .probes = probe_lists[0..probe_len],
                     .query_q8 = query_q8,
-                    .start = chunk_starts[i],
-                    .end = chunk_ends[i],
+                    .start = start,
+                    .end = end,
                     .out = local_buffers[i],
                     .out_len = &local_lens[i],
                 };
-                thread.* = try std.Thread.spawn(.{}, Context.run, .{ctx});
+                thread.* = try std.Thread.spawn(.{}, ScanContext.run, .{ctx});
             }
 
             for (threads) |thread| thread.join();
         } else {
-            const ctx = Context{
+            const ctx = ScanContext{
                 .db = self,
                 .probes = probe_lists[0..probe_len],
                 .query_q8 = query_q8,
-                .start = chunk_starts[0],
-                .end = chunk_ends[0],
+                .start = 0,
+                .end = probe_len,
                 .out = local_buffers[0],
                 .out_len = &local_lens[0],
             };
-            Context.run(ctx);
+            ScanContext.run(ctx);
         }
 
-        const hnsw_assist_ef = if (self.search_ef >= 256 and self.index.entry_point != null)
-            std.math.clamp(@max(self.search_ef, k * 16), k, self.storage.count)
-        else
-            0;
-        var hnsw_assist = std.ArrayList(usize).init(self.allocator);
-        if (hnsw_assist_ef > 0 and self.index.entry_point != null) {
+        var hnsw_assist_ids: []usize = &[_]usize{};
+        if (use_hnsw_assist) {
+            const hnsw_assist_ef = std.math.clamp(@max(self.search_ef, k * 16), k, self.storage.count);
             self.index.build_rwlock.lockShared();
             defer self.index.build_rwlock.unlockShared();
-            hnsw_assist = try self.index.searchLayer(normalized_query, self.index.entry_point.?, hnsw_assist_ef, 0, &self.storage);
+            // Use int8-accelerated graph search (~10x cheaper per distance than f32)
+            const dim = self.storage.dimension;
+            const items = try self.index.searchLayerI8(query_q8, self.quantized_vectors, dim, self.index.entry_point.?, hnsw_assist_ef, 0);
+            hnsw_assist_ids = try self.allocator.alloc(usize, items.len);
+            for (items, 0..) |item, idx| hnsw_assist_ids[idx] = item.idx;
         }
-        defer hnsw_assist.deinit();
+        defer if (hnsw_assist_ids.len > 0) self.allocator.free(hnsw_assist_ids);
 
-        const candidate_cap = total_candidates + hnsw_assist.items.len;
-        var candidate_ids = try self.allocator.alloc(usize, candidate_cap);
-        defer self.allocator.free(candidate_ids);
-        var candidate_len: usize = 0;
+        const candidate_cap = total_candidates + hnsw_assist_ids.len;
 
         const dedupe_ctx = try self.index.acquireSearchContext(1, self.storage.count);
         const seen = dedupe_ctx.visited;
         const seen_mark = dedupe_ctx.mark;
+
+        var approx_candidates = try self.allocator.alloc(ApproxCandidate, candidate_cap);
+        defer self.allocator.free(approx_candidates);
+        var candidate_len: usize = 0;
 
         for (0..thread_count) |i| {
             const local = local_buffers[i][0..local_lens[i]];
             for (local) |cand| {
                 if (seen[cand.idx] == seen_mark) continue;
                 seen[cand.idx] = seen_mark;
-                candidate_ids[candidate_len] = cand.idx;
+                approx_candidates[candidate_len] = cand;
                 candidate_len += 1;
             }
         }
 
-        for (hnsw_assist.items) |idx| {
+        for (hnsw_assist_ids) |idx| {
             if (seen[idx] == seen_mark) continue;
             seen[idx] = seen_mark;
-            candidate_ids[candidate_len] = idx;
+            approx_candidates[candidate_len] = .{ .idx = idx, .approx_distance = 0.0 };
             candidate_len += 1;
         }
 
         if (candidate_len == 0) return self.searchHnsw(normalized_query, k);
 
-        var reranked = try self.allocator.alloc(SearchResult, candidate_len);
-        defer self.allocator.free(reranked);
+        // Sort by approximate distance — enables int8 early rejection during reranking
+        std.sort.heap(ApproxCandidate, approx_candidates[0..candidate_len], {}, struct {
+            fn lessThan(context: void, a: ApproxCandidate, b: ApproxCandidate) bool {
+                _ = context;
+                return a.approx_distance < b.approx_distance;
+            }
+        }.lessThan);
 
-        for (candidate_ids[0..candidate_len], 0..) |idx, i| {
-            const vec = self.storage.getVector(idx);
-            reranked[i] = .{
-                .idx = idx,
-                .distance = VectorOps.cosineDistanceFast(normalized_query, vec),
-                .vector = vec,
-            };
+        // Rerank with max-heap top-k + int8 early rejection
+        const heap_k = @min(k, candidate_len);
+        var heap_buf2: [64]SearchResult = undefined;
+        const heap = if (heap_k <= 64) heap_buf2[0..heap_k] else try self.allocator.alloc(SearchResult, heap_k);
+        defer if (heap_k > 64) self.allocator.free(heap);
+        var heap_len: usize = 0;
+        var threshold: f32 = std.math.inf(f32);
+
+        const INT8_MARGIN_ASSIST: f32 = 0.08;
+
+        for (approx_candidates[0..candidate_len], 0..) |cand, i| {
+            // Skip candidates clearly worse than current best (int8 early rejection)
+            if (heap_len >= heap_k and cand.approx_distance > threshold + INT8_MARGIN_ASSIST) continue;
+
+            if (i + 1 < candidate_len) {
+                const next_vec = self.storage.getVector(approx_candidates[i + 1].idx);
+                @prefetch(next_vec.ptr, .{ .rw = .read, .locality = 0, .cache = .data });
+            }
+            const dist = VectorOps.cosineDistanceQueryStorage(normalized_query, self.storage.getVector(cand.idx));
+
+            if (heap_len < heap_k) {
+                heap[heap_len] = .{ .idx = cand.idx, .distance = dist, .vector = self.resultVectorSlice(cand.idx) };
+                var pos = heap_len;
+                while (pos > 0) {
+                    const parent = (pos - 1) / 2;
+                    if (heap[pos].distance > heap[parent].distance) {
+                        const tmp = heap[pos];
+                        heap[pos] = heap[parent];
+                        heap[parent] = tmp;
+                        pos = parent;
+                    } else break;
+                }
+                heap_len += 1;
+                if (heap_len == heap_k) threshold = heap[0].distance;
+            } else if (dist < heap[0].distance) {
+                heap[0] = .{ .idx = cand.idx, .distance = dist, .vector = self.resultVectorSlice(cand.idx) };
+                var pos: usize = 0;
+                while (true) {
+                    const left = 2 * pos + 1;
+                    const right = 2 * pos + 2;
+                    var largest = pos;
+                    if (left < heap_len and heap[left].distance > heap[largest].distance) largest = left;
+                    if (right < heap_len and heap[right].distance > heap[largest].distance) largest = right;
+                    if (largest == pos) break;
+                    const tmp = heap[pos];
+                    heap[pos] = heap[largest];
+                    heap[largest] = tmp;
+                    pos = largest;
+                }
+                threshold = heap[0].distance;
+            }
         }
 
-        std.sort.heap(SearchResult, reranked, {}, struct {
+        std.sort.heap(SearchResult, heap[0..heap_len], {}, struct {
             fn lessThan(context: void, a: SearchResult, b: SearchResult) bool {
                 _ = context;
                 return a.distance < b.distance;
             }
         }.lessThan);
 
-        const out_len = @min(k, candidate_len);
-        const out = try self.allocator.alloc(SearchResult, out_len);
-        @memcpy(out, reranked[0..out_len]);
+        const out = try self.allocator.alloc(SearchResult, heap_len);
+        @memcpy(out, heap[0..heap_len]);
         return out;
     }
 
@@ -2091,15 +3653,21 @@ pub const VectorDB = struct {
         @memcpy(normalized_query, query);
         VectorOps.normalize(normalized_query);
 
-        if (self.storage.count <= BRUTE_FORCE_THRESHOLD or self.index.entry_point == null) {
-            return self.searchBruteForce(normalized_query, k);
+        const results = if (self.storage.count <= BRUTE_FORCE_THRESHOLD or self.index.entry_point == null)
+            try self.searchBruteForce(normalized_query, k)
+        else if (self.turbo_enabled and self.storage.count >= self.ivf_min_vectors)
+            try self.searchTurbo(normalized_query, k)
+        else
+            try self.searchHnsw(normalized_query, k);
+
+        // Translate internal physical IDs → external insertion IDs
+        if (self.internal_to_external.items.len > 0) {
+            for (results) |*r| {
+                r.idx = self.internal_to_external.items[r.idx];
+            }
         }
 
-        if (self.turbo_enabled and self.storage.count >= self.ivf_min_vectors) {
-            return self.searchTurbo(normalized_query, k);
-        }
-
-        return self.searchHnsw(normalized_query, k);
+        return results;
     }
 
     pub const SearchResult = struct {
@@ -2115,11 +3683,60 @@ pub const VectorDB = struct {
             if (vector.len != self.storage.dimension) return error.InvalidDimension;
         }
 
-        // Fill storage in parallel, then build the graph with concurrent search phases.
+        // Fill storage first, then pre-allocate nodes so insert workers avoid global write-lock convoy.
         const start_idx = try self.storage.appendBatchNormalized(vectors);
-        try self.index.reserveCapacity(vectors.len);
+        try self.index.reserveCapacity(start_idx + vectors.len);
 
-        const thread_count = @max(1, @min(std.Thread.getCpuCount() catch 1, vectors.len));
+        // Track external IDs (at insertion time, external == physical)
+        try self.internal_to_external.ensureTotalCapacity(start_idx + vectors.len);
+        for (0..vectors.len) |i| {
+            self.internal_to_external.appendAssumeCapacity(start_idx + i);
+        }
+
+        {
+            self.index.build_rwlock.lock();
+            defer self.index.build_rwlock.unlock();
+
+            const target_len = start_idx + vectors.len;
+            try self.index.nodes.ensureTotalCapacity(target_len);
+
+            while (self.index.nodes.items.len < start_idx) {
+                const filler = try HNSWIndex.Node.init(self.index.allocator, 0);
+                self.index.nodes.appendAssumeCapacity(filler);
+            }
+
+            var i: usize = 0;
+            while (i < vectors.len) : (i += 1) {
+                const node_idx = start_idx + i;
+                const level = self.index.selectLevel();
+                const node = try HNSWIndex.Node.init(self.index.allocator, level);
+                if (node_idx < self.index.nodes.items.len) {
+                    self.index.nodes.items[node_idx].deinit(self.index.allocator);
+                    self.index.nodes.items[node_idx] = node;
+                } else {
+                    self.index.nodes.appendAssumeCapacity(node);
+                }
+            }
+
+            if (self.index.entry_point == null) {
+                self.index.entry_point = start_idx;
+                self.index.max_level = self.index.nodes.items[start_idx].level;
+            }
+
+            // Pre-allocate edge slots for all new nodes so the parallel insert phase
+            // never touches edge_pool_mutex (eliminates lock contention on hot path).
+            for (start_idx..start_idx + vectors.len) |ni| {
+                const node = &self.index.nodes.items[ni];
+                for (0..node.connections.len) |lvl| {
+                    const cap = if (lvl == 0) self.index.m * 2 else self.index.m;
+                    node.connections[lvl].offset = try self.index.allocateEdges(cap);
+                    node.connections[lvl].capacity = cap;
+                    node.connections[lvl].len = 0;
+                }
+            }
+        }
+
+        const thread_count = @max(1, @min(configuredCpuCount(), vectors.len));
         if (thread_count > 1 and vectors.len >= thread_count * 128) {
             const threads = try self.allocator.alloc(std.Thread, thread_count);
             defer self.allocator.free(threads);
@@ -2133,7 +3750,7 @@ pub const VectorDB = struct {
                 fn run(ctx: @This()) void {
                     var i = ctx.start;
                     while (i < ctx.end) : (i += 1) {
-                        ctx.db.index.insertParallel(ctx.start_idx + i, &ctx.db.storage) catch |err| {
+                        ctx.db.index.insertParallelNoAlloc(ctx.start_idx + i, &ctx.db.storage) catch |err| {
                             @panic(@errorName(err));
                         };
                     }
@@ -2157,18 +3774,23 @@ pub const VectorDB = struct {
         } else {
             var i: usize = 0;
             while (i < vectors.len) : (i += 1) {
-                try self.index.insert(start_idx + i, &self.storage);
+                try self.index.insertParallelNoAlloc(start_idx + i, &self.storage);
             }
         }
 
-        self.turbo_dirty = true;
+        // Pre-build turbo index so first query doesn't pay rebuild cost
+        if (self.turbo_enabled and self.storage.count >= self.ivf_min_vectors) {
+            try self.rebuildTurboIndex();
+        } else {
+            self.turbo_dirty = true;
+        }
     }
 
     pub fn searchBatch(self: *VectorDB, queries: []const []const f32, k: usize) ![][]SearchResult {
         var results = try self.allocator.alloc([]SearchResult, queries.len);
 
         // Process queries in parallel using all CPU cores
-        const thread_count = @max(1, std.Thread.getCpuCount() catch 1);
+        const thread_count = configuredCpuCount();
         const chunk_size = (queries.len + thread_count - 1) / thread_count;
 
         if (thread_count > 1 and queries.len > thread_count) {
@@ -2233,16 +3855,24 @@ pub const VectorDB = struct {
         try file.writer().writeInt(u32, @intCast(self.storage.dimension), .little);
         try file.writer().writeInt(u32, @intCast(self.storage.count), .little);
 
-        // Write vectors
-        if (self.storage.use_slabs) {
-            var i: usize = 0;
-            while (i < self.storage.count) : (i += 1) {
-                const vec = self.storage.getVector(i);
+        // Write vectors as f32 for portable persistence across storage modes.
+        var tmp_vec: []f32 = &[_]f32{};
+        if (comptime StorageScalar != f32) {
+            tmp_vec = try self.allocator.alloc(f32, self.storage.dimension);
+        }
+        defer if (comptime StorageScalar != f32) self.allocator.free(tmp_vec);
+
+        var i: usize = 0;
+        while (i < self.storage.count) : (i += 1) {
+            const vec = self.storage.getVector(i);
+            if (comptime StorageScalar == f32) {
                 try file.writeAll(mem.sliceAsBytes(vec));
+            } else {
+                for (vec, 0..) |v, d| {
+                    tmp_vec[d] = VectorOps.toF32(v);
+                }
+                try file.writeAll(mem.sliceAsBytes(tmp_vec));
             }
-        } else {
-            const data_size = self.storage.count * self.storage.dimension * @sizeOf(f32);
-            try file.writeAll(self.storage.data[0..data_size]);
         }
 
         // Write index structure
@@ -2303,25 +3933,26 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+    const demo_vector_count: usize = configuredDemoVectorCount(100_000);
 
     // Create a vector database optimized for speed
     var db = try VectorDB.init(allocator, 768, .{ // 768d vectors (common embedding size)
-        .initial_capacity = 10000,
-        .index_m = 32, // Higher M for better connectivity
-        .index_ef_construction = 400, // Higher ef_construction for better build quality
+        .initial_capacity = demo_vector_count,
+        .index_m = 12, // Lean graph (turbo IVF path handles search quality)
+        .index_ef_construction = 64, // Fast build; turbo path compensates for graph quality
     });
     defer db.deinit();
 
     // Pre-allocate for batch insertion
-    try db.storage.reserveCapacity(10000);
-    try db.index.reserveCapacity(10000);
+    try db.storage.reserveCapacity(demo_vector_count);
+    try db.index.reserveCapacity(demo_vector_count);
 
     // Add vectors in batches for maximum throughput
     var rng = std.Random.DefaultPrng.init(42);
-    const vectors = try allocator.alloc([768]f32, 10000);
+    const vectors = try allocator.alloc([768]f32, demo_vector_count);
     defer allocator.free(vectors);
 
-    std.debug.print("Generating 10,000 vectors...\n", .{});
+    std.debug.print("Generating {} vectors...\n", .{demo_vector_count});
     for (vectors) |*vector| {
         for (vector) |*v| {
             v.* = rng.random().float(f32) * 2.0 - 1.0; // [-1, 1] range
@@ -2429,8 +4060,15 @@ test "vector storage" {
 
     // Use approximate equality for floating point comparison
     try std.testing.expectEqual(normalized_v1.len, retrieved.len);
+    const tol: f32 = if (comptime StorageScalar == f32)
+        0.0001
+    else if (comptime StorageScalar == f16)
+        0.002
+    else
+        0.02;
     for (normalized_v1, retrieved) |expected, actual| {
-        try std.testing.expectApproxEqAbs(expected, actual, 0.0001);
+        const actual_f32 = VectorOps.toF32(actual);
+        try std.testing.expectApproxEqAbs(expected, actual_f32, tol);
     }
 }
 
