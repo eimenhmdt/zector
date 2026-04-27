@@ -3,6 +3,12 @@ zig-cache/
 zig-out/
 .zig-cache/
 
+# Python/local benchmark artifacts
+.venv/
+__pycache__/
+*.pyc
+*.hdf5
+
 # Editor/IDE files
 .vscode/
 .idea/

@@ -81,7 +81,7 @@ pub fn build(b: *std.Build) void {
     const options = b.addOptions();
     options.addOption([]const u8, "storage_mode", storage_mode);
 
-    // Library
+    // Static library
     const lib = b.addStaticLibrary(.{
         .name = "vector-db",
         .root_source_file = b.path("src/main.zig"),
@@ -90,6 +90,21 @@ pub fn build(b: *std.Build) void {
     });
     lib.root_module.addOptions("config", options);
     b.installArtifact(lib);
+
+    // Shared library (for Python / FFI)
+    const shared_lib = b.addSharedLibrary(.{
+        .name = "zector",
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    shared_lib.root_module.addOptions("config", options);
+    shared_lib.linkLibC();
+    b.installArtifact(shared_lib);
+
+    const install_shared = b.addInstallArtifact(shared_lib, .{});
+    const shared_lib_step = b.step("shared", "Build shared library (libzector.dylib/.so)");
+    shared_lib_step.dependOn(&install_shared.step);
 
     // Main executable
     const exe = b.addExecutable(.{

@@ -1092,6 +1092,46 @@ const HNSWIndex = struct {
         distance: f32,
     };
 
+    /// 32KB L1-cache-resident bloom filter for fast visited pre-check.
+    /// Bit NOT set → definitely unvisited (fast path, stays in L1).
+    /// Bit IS set → maybe visited, fall back to mark array (rare path).
+    const BLOOM_BITS = 256 * 1024; // 256K bits = 32KB
+    const BLOOM_WORDS = BLOOM_BITS / 64;
+    const BloomFilter = [BLOOM_WORDS]u64;
+
+    inline fn bloomHash(node_id: usize) struct { word: usize, bit: u6 } {
+        // Multiplicative hash (Knuth's golden ratio) for uniform distribution
+        const h = node_id *% 0x9E3779B97F4A7C15;
+        const idx = h >> (64 - 18); // 18 bits = 256K positions
+        return .{
+            .word = idx >> 6,
+            .bit = @truncate(idx & 63),
+        };
+    }
+
+    inline fn bloomSet(bloom: *BloomFilter, node_id: usize) void {
+        const h = bloomHash(node_id);
+        bloom[h.word] |= @as(u64, 1) << h.bit;
+    }
+
+    inline fn bloomTest(bloom: *const BloomFilter, node_id: usize) bool {
+        const h = bloomHash(node_id);
+        return (bloom[h.word] & (@as(u64, 1) << h.bit)) != 0;
+    }
+
+    /// Check if node is visited using bloom filter + mark array fallback.
+    /// Fast path (bloom says "not set") stays entirely in L1 cache.
+    inline fn isVisited(bloom: *const BloomFilter, visited: []const u32, node_id: usize, mark: u32) bool {
+        if (!bloomTest(bloom, node_id)) return false;
+        return visited[node_id] == mark;
+    }
+
+    /// Mark node as visited in both bloom filter and mark array.
+    inline fn markVisited(bloom: *BloomFilter, visited: []u32, node_id: usize, mark: u32) void {
+        bloomSet(bloom, node_id);
+        visited[node_id] = mark;
+    }
+
     const SearchContext = struct {
         thread_id: std.Thread.Id,
         visited: []u32,
@@ -1366,7 +1406,7 @@ const HNSWIndex = struct {
         dist: f32, // distance(node, neighbor)
         storage: *const VectorStorage, // for computing distances during pruning
     ) !void {
-        _ = storage; // Not needed anymore since we cache distances
+        _ = storage; // Not needed here since connection distances are cached.
         const node = &self.nodes.items[node_idx];
         if (level > node.level) return; // node has no such layer
 
@@ -1419,7 +1459,7 @@ const HNSWIndex = struct {
             self.distance_pool.items[offset + insert_pos] = dist;
             conn.len += 1;
         } else {
-            // Already full – if new distance is worse than the current worst, ignore.
+            // Already full - if new distance is worse than the current worst, ignore.
             if (insert_pos == conn.capacity) return;
 
             // Otherwise insert and drop the last (worst) entry.
@@ -1520,6 +1560,52 @@ const HNSWIndex = struct {
         return selected_count;
     }
 
+    fn linkCandidatesAtLevel(
+        self: *HNSWIndex,
+        idx: usize,
+        level: usize,
+        candidates: []SearchItem,
+        storage: *const VectorStorage,
+    ) !void {
+        const m = if (level == 0) self.m * 2 else self.m;
+
+        var level_candidates_stack: [2048]SearchItem = undefined;
+        var lc_len: usize = 0;
+        for (candidates) |item| {
+            if (item.idx == idx) continue;
+            if (level > self.nodes.items[item.idx].level) continue;
+            if (lc_len < level_candidates_stack.len) {
+                level_candidates_stack[lc_len] = item;
+                lc_len += 1;
+            }
+        }
+
+        const keep_count = self.selectNeighborsHeuristic(
+            level_candidates_stack[0..lc_len],
+            m,
+            storage,
+        );
+
+        for (level_candidates_stack[0..keep_count]) |item| {
+            const neighbor = item.idx;
+            const dist = item.distance;
+
+            {
+                const node = &self.nodes.items[idx];
+                node.spinLock();
+                defer node.spinUnlock();
+                try self.addConnection(idx, neighbor, level, dist, storage);
+            }
+
+            {
+                const neighbor_node = &self.nodes.items[neighbor];
+                neighbor_node.spinLock();
+                defer neighbor_node.spinUnlock();
+                try self.addConnection(neighbor, idx, level, dist, storage);
+            }
+        }
+    }
+
     /// Optimized concurrent insert path used by batch ingestion.
     /// Expects `nodes[idx]` to already exist with a selected level.
     pub fn insertParallelNoAlloc(self: *HNSWIndex, idx: usize, storage: *const VectorStorage) !void {
@@ -1543,77 +1629,49 @@ const HNSWIndex = struct {
         // Entry point for an empty graph has nothing to link yet.
         if (idx == old_entry) return;
 
-        var nearest_copy: []SearchItem = &[_]SearchItem{};
+        const vector = storage.getVector(idx);
+        var current_entry = old_entry;
 
-        // Search with shared lock, copy results, then link without global lock.
-        {
+        if (entry_level > level) {
             self.build_rwlock.lockShared();
             defer self.build_rwlock.unlockShared();
 
-            const vector = storage.getVector(idx);
-            var current_entry = old_entry;
-
-            if (entry_level > 0) {
-                var l = @min(level, entry_level);
-                while (l > 0) : (l -= 1) {
-                    const nearest_at_level = try self.searchLayerInsert(vector, current_entry, self.ef_construction, l, storage);
-                    if (nearest_at_level.len > 0) {
-                        current_entry = nearest_at_level[0].idx;
-                    }
+            var l: usize = entry_level;
+            while (l > level) : (l -= 1) {
+                const nearest_at_level = try self.searchLayerInsert(vector, current_entry, 1, l, storage);
+                if (nearest_at_level.len > 0) {
+                    current_entry = nearest_at_level[0].idx;
                 }
             }
-
-            const nearest = try self.searchLayerInsert(vector, current_entry, self.ef_construction, 0, storage);
-            const ctx = if (tl_search_owner == self and tl_search_context != null)
-                tl_search_context.?
-            else
-                try self.acquireSearchContext(@max(nearest.len, 1), self.nodes.items.len);
-
-            try ensureBuffer(SearchItem, self.allocator, &ctx.scratch_results, nearest.len);
-            @memcpy(ctx.scratch_results[0..nearest.len], nearest);
-            nearest_copy = ctx.scratch_results[0..nearest.len];
         }
 
-        var l: usize = 0;
-        while (l <= level) : (l += 1) {
-            const m = if (l == 0) self.m * 2 else self.m;
+        var link_level: usize = @min(@as(usize, level), @as(usize, entry_level));
+        while (true) {
+            var nearest_copy: []SearchItem = &[_]SearchItem{};
 
-            // Filter candidates valid for this level
-            var level_candidates_stack: [1024]SearchItem = undefined;
-            var lc_len: usize = 0;
+            {
+                self.build_rwlock.lockShared();
+                defer self.build_rwlock.unlockShared();
 
-            for (nearest_copy) |item| {
-                if (item.idx == idx) continue;
-                if (l > self.nodes.items[item.idx].level) continue;
-                if (lc_len < level_candidates_stack.len) {
-                    level_candidates_stack[lc_len] = item;
-                    lc_len += 1;
+                const nearest = try self.searchLayerInsert(vector, current_entry, self.ef_construction, link_level, storage);
+                const ctx = if (tl_search_owner == self and tl_search_context != null)
+                    tl_search_context.?
+                else
+                    try self.acquireSearchContext(@max(nearest.len, 1), self.nodes.items.len);
+
+                try ensureBuffer(SearchItem, self.allocator, &ctx.scratch_results, nearest.len);
+                @memcpy(ctx.scratch_results[0..nearest.len], nearest);
+                nearest_copy = ctx.scratch_results[0..nearest.len];
+
+                if (nearest.len > 0) {
+                    current_entry = nearest[0].idx;
                 }
             }
 
-            // Apply HNSW spatial pruning heuristic for diverse neighbor selection
-            const keep_count = self.selectNeighborsHeuristic(
-                level_candidates_stack[0..lc_len],
-                m,
-                storage,
-            );
+            try self.linkCandidatesAtLevel(idx, link_level, nearest_copy, storage);
 
-            for (level_candidates_stack[0..keep_count]) |item| {
-                const neighbor = item.idx;
-                const dist = item.distance;
-
-                // Self-node: single writer per idx, no lock needed
-                try self.addConnection(idx, neighbor, l, dist, storage);
-
-                // Neighbor node: try-lock, skip if contended
-                {
-                    const neighbor_node = &self.nodes.items[neighbor];
-                    if (neighbor_node.trySpinLock()) {
-                        defer neighbor_node.spinUnlock();
-                        try self.addConnection(neighbor, idx, l, dist, storage);
-                    }
-                }
-            }
+            if (link_level == 0) break;
+            link_level -= 1;
         }
 
         // Publish higher-level entry points under exclusive lock.
@@ -1628,64 +1686,86 @@ const HNSWIndex = struct {
         }
     }
 
-    // ── Heap helpers for search priority queues ──────────────────────────
+    // ── Sorted array helpers for search priority queues ────────────────
+    // Flat sorted arrays eliminate branch mispredictions from heap sifts.
+    // Binary search + memmove compiles to SIMD vector moves on ARM/x86.
 
-    inline fn heapSiftUpMin(items: []SearchItem, pos: usize) void {
-        var child = pos;
-        while (child > 0) {
-            const parent = (child - 1) / 2;
-            if (items[child].distance >= items[parent].distance) break;
-            const tmp = items[child];
-            items[child] = items[parent];
-            items[parent] = tmp;
-            child = parent;
+    /// Candidates: sorted DESCENDING by distance (closest at end for O(1) pop-min).
+    /// Insert into sorted position using binary search + shift.
+    inline fn sortedInsertDesc(items: []SearchItem, len: *usize, new: SearchItem) void {
+        const n = len.*;
+        if (n >= items.len) return;
+        // Binary search for insert position (descending order)
+        var lo: usize = 0;
+        var hi: usize = n;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (items[mid].distance > new.distance) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        // Shift right to make room
+        if (n > lo) {
+            mem.copyBackwards(SearchItem, items[lo + 1 .. n + 1], items[lo..n]);
+        }
+        items[lo] = new;
+        len.* = n + 1;
+    }
+
+    /// Pop the closest candidate (last element in descending array). O(1).
+    inline fn sortedPopMin(items: []SearchItem, len: *usize) SearchItem {
+        len.* -= 1;
+        return items[len.*];
+    }
+
+    /// Results: sorted ASCENDING by distance (farthest at end).
+    /// worst = items[len-1]. Insert maintains sorted order.
+    inline fn sortedInsertAsc(items: []SearchItem, len: *usize, cap: usize, new: SearchItem) void {
+        const n = len.*;
+        if (n < cap) {
+            // Not full yet — insert in sorted position
+            var lo: usize = 0;
+            var hi: usize = n;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (items[mid].distance < new.distance) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            if (n > lo) {
+                mem.copyBackwards(SearchItem, items[lo + 1 .. n + 1], items[lo..n]);
+            }
+            items[lo] = new;
+            len.* = n + 1;
+        } else {
+            // Full — replace worst (last element) if new is better
+            if (new.distance >= items[n - 1].distance) return;
+            // Find insert position
+            var lo: usize = 0;
+            var hi: usize = n - 1;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (items[mid].distance < new.distance) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            // Shift elements right from lo to n-2, dropping last
+            if (n - 1 > lo) {
+                mem.copyBackwards(SearchItem, items[lo + 1 .. n], items[lo .. n - 1]);
+            }
+            items[lo] = new;
         }
     }
 
-    inline fn heapSiftDownMin(items: []SearchItem, pos: usize) void {
-        var parent = pos;
-        const len = items.len;
-        while (true) {
-            var smallest = parent;
-            const left = 2 * parent + 1;
-            const right = 2 * parent + 2;
-            if (left < len and items[left].distance < items[smallest].distance) smallest = left;
-            if (right < len and items[right].distance < items[smallest].distance) smallest = right;
-            if (smallest == parent) break;
-            const tmp = items[parent];
-            items[parent] = items[smallest];
-            items[smallest] = tmp;
-            parent = smallest;
-        }
-    }
-
-    inline fn heapSiftUpMax(items: []SearchItem, pos: usize) void {
-        var child = pos;
-        while (child > 0) {
-            const parent = (child - 1) / 2;
-            if (items[child].distance <= items[parent].distance) break;
-            const tmp = items[child];
-            items[child] = items[parent];
-            items[parent] = tmp;
-            child = parent;
-        }
-    }
-
-    inline fn heapSiftDownMax(items: []SearchItem, pos: usize) void {
-        var parent = pos;
-        const len = items.len;
-        while (true) {
-            var largest = parent;
-            const left = 2 * parent + 1;
-            const right = 2 * parent + 2;
-            if (left < len and items[left].distance > items[largest].distance) largest = left;
-            if (right < len and items[right].distance > items[largest].distance) largest = right;
-            if (largest == parent) break;
-            const tmp = items[parent];
-            items[parent] = items[largest];
-            items[largest] = tmp;
-            parent = largest;
-        }
+    /// Get the worst (farthest) distance in ascending result array.
+    inline fn sortedWorstDist(items: []const SearchItem, len: usize) f32 {
+        return items[len - 1].distance;
     }
 
     fn searchLayerInsert(
@@ -1700,35 +1780,28 @@ const HNSWIndex = struct {
         const ctx = try self.acquireSearchContext(ef, self.nodes.items.len);
         const mark = ctx.mark;
         const visited = ctx.visited;
-        const c_items = ctx.candidates; // min-heap: closest candidate at top
-        const w_items = ctx.w; // max-heap: farthest result at top
+        const c_items = ctx.candidates; // sorted descending (closest at end)
+        const w_items = ctx.w; // sorted ascending (worst at end)
         var c_len: usize = 0;
         var w_len: usize = 0;
 
+        // L1-resident bloom filter: 32KB on stack, zero-init
+        var bloom: BloomFilter = @splat(0);
+
         const entry_dist = VectorOps.cosineDistanceStorage(query, storage.getVector(entry));
-        c_items[0] = .{ .idx = entry, .distance = entry_dist };
-        c_len = 1;
-        w_items[0] = .{ .idx = entry, .distance = entry_dist };
-        w_len = 1;
-        visited[entry] = mark;
+        const entry_item = SearchItem{ .idx = entry, .distance = entry_dist };
+        sortedInsertDesc(c_items, &c_len, entry_item);
+        sortedInsertAsc(w_items, &w_len, ef, entry_item);
+        markVisited(&bloom, visited, entry, mark);
 
         while (c_len > 0) {
-            // Pop closest candidate (min-heap root)
-            const current = c_items[0];
+            const current = sortedPopMin(c_items, &c_len);
 
-            // Early termination: closest candidate farther than worst result
-            if (w_len >= ef and current.distance > w_items[0].distance) break;
-
-            c_len -= 1;
-            if (c_len > 0) {
-                c_items[0] = c_items[c_len];
-                heapSiftDownMin(c_items[0..c_len], 0);
-            }
+            if (w_len >= ef and current.distance > sortedWorstDist(w_items, w_len)) break;
 
             if (layer > self.nodes.items[current.idx].level) continue;
             const connections = self.getConnections(current.idx, layer);
 
-            // Prefetch first neighbor vectors + node metadata to hide memory latency
             const pf_count = @min(connections.len, 8);
             for (connections[0..pf_count]) |neighbor| {
                 const vec = storage.getVector(neighbor);
@@ -1737,10 +1810,9 @@ const HNSWIndex = struct {
             }
 
             for (connections, 0..) |neighbor, ci| {
-                if (visited[neighbor] == mark) continue;
-                visited[neighbor] = mark;
+                if (isVisited(&bloom, visited, neighbor, mark)) continue;
+                markVisited(&bloom, visited, neighbor, mark);
 
-                // Prefetch ahead — both vectors and node metadata
                 if (ci + pf_count < connections.len) {
                     const ahead_id = connections[ci + pf_count];
                     const ahead = storage.getVector(ahead_id);
@@ -1750,34 +1822,14 @@ const HNSWIndex = struct {
 
                 const dist = VectorOps.cosineDistanceStorage(query, storage.getVector(neighbor));
 
-                if (w_len < ef or dist < w_items[0].distance) {
-                    // Push to candidate min-heap
-                    if (c_len < c_items.len) {
-                        c_items[c_len] = .{ .idx = neighbor, .distance = dist };
-                        heapSiftUpMin(c_items[0 .. c_len + 1], c_len);
-                        c_len += 1;
-                    }
-
-                    // Push to result max-heap
-                    if (w_len < ef) {
-                        w_items[w_len] = .{ .idx = neighbor, .distance = dist };
-                        heapSiftUpMax(w_items[0 .. w_len + 1], w_len);
-                        w_len += 1;
-                    } else {
-                        w_items[0] = .{ .idx = neighbor, .distance = dist };
-                        heapSiftDownMax(w_items[0..w_len], 0);
-                    }
+                if (w_len < ef or dist < sortedWorstDist(w_items, w_len)) {
+                    sortedInsertDesc(c_items, &c_len, .{ .idx = neighbor, .distance = dist });
+                    sortedInsertAsc(w_items, &w_len, ef, .{ .idx = neighbor, .distance = dist });
                 }
             }
         }
 
-        std.sort.heap(SearchItem, w_items[0..w_len], {}, struct {
-            fn lessThan(context: void, a: SearchItem, b: SearchItem) bool {
-                _ = context;
-                return a.distance < b.distance;
-            }
-        }.lessThan);
-
+        // w_items already sorted ascending — no sort needed
         return w_items[0..w_len];
     }
 
@@ -1793,78 +1845,48 @@ const HNSWIndex = struct {
         const ctx = try self.acquireSearchContext(ef, self.nodes.items.len);
         const visited = ctx.visited;
         const mark = ctx.mark;
-        const c_items = ctx.candidates; // min-heap: closest at top
-        const w_items = ctx.w; // max-heap: farthest at top
+        const c_items = ctx.candidates; // sorted descending (closest at end)
+        const w_items = ctx.w; // sorted ascending (worst at end)
         var c_len: usize = 0;
         var w_len: usize = 0;
 
+        var bloom: BloomFilter = @splat(0);
+
         const entry_dist = VectorOps.cosineDistanceQueryStorage(query, storage.getVector(entry));
-        c_items[0] = .{ .idx = entry, .distance = entry_dist };
-        c_len = 1;
-        w_items[0] = .{ .idx = entry, .distance = entry_dist };
-        w_len = 1;
-        visited[entry] = mark;
+        const entry_item = SearchItem{ .idx = entry, .distance = entry_dist };
+        sortedInsertDesc(c_items, &c_len, entry_item);
+        sortedInsertAsc(w_items, &w_len, ef, entry_item);
+        markVisited(&bloom, visited, entry, mark);
 
         while (c_len > 0) {
-            // Pop closest candidate (min-heap root)
-            const current = c_items[0];
+            const current = sortedPopMin(c_items, &c_len);
 
-            // Early termination: closest candidate farther than worst result
-            if (w_len >= ef and current.distance > w_items[0].distance) break;
-
-            c_len -= 1;
-            if (c_len > 0) {
-                c_items[0] = c_items[c_len];
-                heapSiftDownMin(c_items[0..c_len], 0);
-            }
+            if (w_len >= ef and current.distance > sortedWorstDist(w_items, w_len)) break;
 
             if (layer > self.nodes.items[current.idx].level) continue;
             const connections = self.getConnections(current.idx, layer);
 
-            // Prefetch first few neighbor vectors + their node metadata
             const prefetch_count = @min(connections.len, 8);
             for (connections[0..prefetch_count]) |neighbor| {
                 const vec = storage.getVector(neighbor);
                 @prefetch(vec.ptr, .{ .rw = .read, .locality = 0, .cache = .data });
-                // Prefetch node metadata for future graph expansion
                 @prefetch(@as([*]const u8, @ptrCast(&self.nodes.items[neighbor])), .{ .rw = .read, .locality = 1, .cache = .data });
             }
 
             for (connections) |neighbor| {
-                if (visited[neighbor] == mark) continue;
-                visited[neighbor] = mark;
+                if (isVisited(&bloom, visited, neighbor, mark)) continue;
+                markVisited(&bloom, visited, neighbor, mark);
 
                 const dist = VectorOps.cosineDistanceQueryStorage(query, storage.getVector(neighbor));
 
-                if (w_len < ef or dist < w_items[0].distance) {
-                    // Push to candidate min-heap
-                    if (c_len < c_items.len) {
-                        c_items[c_len] = .{ .idx = neighbor, .distance = dist };
-                        heapSiftUpMin(c_items[0 .. c_len + 1], c_len);
-                        c_len += 1;
-                    }
-
-                    // Push to result max-heap
-                    if (w_len < ef) {
-                        w_items[w_len] = .{ .idx = neighbor, .distance = dist };
-                        heapSiftUpMax(w_items[0 .. w_len + 1], w_len);
-                        w_len += 1;
-                    } else {
-                        w_items[0] = .{ .idx = neighbor, .distance = dist };
-                        heapSiftDownMax(w_items[0..w_len], 0);
-                    }
+                if (w_len < ef or dist < sortedWorstDist(w_items, w_len)) {
+                    sortedInsertDesc(c_items, &c_len, .{ .idx = neighbor, .distance = dist });
+                    sortedInsertAsc(w_items, &w_len, ef, .{ .idx = neighbor, .distance = dist });
                 }
             }
         }
 
-        // Sort results by distance ascending
-        std.sort.heap(SearchItem, w_items[0..w_len], {}, struct {
-            fn lessThan(context: void, a: SearchItem, b: SearchItem) bool {
-                _ = context;
-                return a.distance < b.distance;
-            }
-        }.lessThan);
-
+        // w_items already sorted ascending — no sort needed
         return w_items[0..w_len];
     }
 
@@ -1884,36 +1906,29 @@ const HNSWIndex = struct {
         const ctx = try self.acquireSearchContext(ef, self.nodes.items.len);
         const visited = ctx.visited;
         const mark = ctx.mark;
-        const c_items = ctx.candidates;
-        const w_items = ctx.w;
+        const c_items = ctx.candidates; // sorted descending (closest at end)
+        const w_items = ctx.w; // sorted ascending (worst at end)
         var c_len: usize = 0;
         var w_len: usize = 0;
 
-        // Entry point distance using int8
+        var bloom: BloomFilter = @splat(0);
+
         const entry_q = quantized_vectors[entry * dim ..][0..dim];
         const entry_dot = VectorOps.dotI8(query_q8, entry_q);
         const entry_dist = 1.0 - @as(f32, @floatFromInt(entry_dot)) * INT8_INV_SCALE_SQ;
-        c_items[0] = .{ .idx = entry, .distance = entry_dist };
-        c_len = 1;
-        w_items[0] = .{ .idx = entry, .distance = entry_dist };
-        w_len = 1;
-        visited[entry] = mark;
+        const entry_item = SearchItem{ .idx = entry, .distance = entry_dist };
+        sortedInsertDesc(c_items, &c_len, entry_item);
+        sortedInsertAsc(w_items, &w_len, ef, entry_item);
+        markVisited(&bloom, visited, entry, mark);
 
         while (c_len > 0) {
-            const current = c_items[0];
+            const current = sortedPopMin(c_items, &c_len);
 
-            if (w_len >= ef and current.distance > w_items[0].distance) break;
-
-            c_len -= 1;
-            if (c_len > 0) {
-                c_items[0] = c_items[c_len];
-                heapSiftDownMin(c_items[0..c_len], 0);
-            }
+            if (w_len >= ef and current.distance > sortedWorstDist(w_items, w_len)) break;
 
             if (layer > self.nodes.items[current.idx].level) continue;
             const connections = self.getConnections(current.idx, layer);
 
-            // Prefetch quantized vectors for first neighbors
             const pf_count = @min(connections.len, 8);
             for (connections[0..pf_count]) |neighbor| {
                 @prefetch(quantized_vectors.ptr + neighbor * dim, .{ .rw = .read, .locality = 0, .cache = .data });
@@ -1921,8 +1936,8 @@ const HNSWIndex = struct {
             }
 
             for (connections, 0..) |neighbor, ci| {
-                if (visited[neighbor] == mark) continue;
-                visited[neighbor] = mark;
+                if (isVisited(&bloom, visited, neighbor, mark)) continue;
+                markVisited(&bloom, visited, neighbor, mark);
 
                 if (ci + pf_count < connections.len) {
                     const ahead_id = connections[ci + pf_count];
@@ -1934,31 +1949,79 @@ const HNSWIndex = struct {
                 const dot_i32 = VectorOps.dotI8(query_q8, qvec);
                 const dist = 1.0 - @as(f32, @floatFromInt(dot_i32)) * INT8_INV_SCALE_SQ;
 
-                if (w_len < ef or dist < w_items[0].distance) {
-                    if (c_len < c_items.len) {
-                        c_items[c_len] = .{ .idx = neighbor, .distance = dist };
-                        heapSiftUpMin(c_items[0 .. c_len + 1], c_len);
-                        c_len += 1;
-                    }
-
-                    if (w_len < ef) {
-                        w_items[w_len] = .{ .idx = neighbor, .distance = dist };
-                        heapSiftUpMax(w_items[0 .. w_len + 1], w_len);
-                        w_len += 1;
-                    } else {
-                        w_items[0] = .{ .idx = neighbor, .distance = dist };
-                        heapSiftDownMax(w_items[0..w_len], 0);
-                    }
+                if (w_len < ef or dist < sortedWorstDist(w_items, w_len)) {
+                    sortedInsertDesc(c_items, &c_len, .{ .idx = neighbor, .distance = dist });
+                    sortedInsertAsc(w_items, &w_len, ef, .{ .idx = neighbor, .distance = dist });
                 }
             }
         }
 
-        std.sort.heap(SearchItem, w_items[0..w_len], {}, struct {
-            fn lessThan(context: void, a: SearchItem, b: SearchItem) bool {
-                _ = context;
-                return a.distance < b.distance;
+        // w_items already sorted ascending — no sort needed
+        return w_items[0..w_len];
+    }
+
+    fn searchLayerStorageI8(
+        self: *HNSWIndex,
+        query_q8: []const i8,
+        entry: usize,
+        num_closest: usize,
+        layer: usize,
+        storage: *const VectorStorage,
+    ) ![]SearchItem {
+        const ef = @max(num_closest, 1);
+        const ctx = try self.acquireSearchContext(ef, self.nodes.items.len);
+        const visited = ctx.visited;
+        const mark = ctx.mark;
+        const c_items = ctx.candidates;
+        const w_items = ctx.w;
+        var c_len: usize = 0;
+        var w_len: usize = 0;
+
+        var bloom: BloomFilter = @splat(0);
+
+        const entry_q = storage.getVector(entry);
+        const entry_dot = VectorOps.dotI8(query_q8, entry_q);
+        const entry_dist = 1.0 - @as(f32, @floatFromInt(entry_dot)) * INT8_INV_SCALE_SQ;
+        const entry_item = SearchItem{ .idx = entry, .distance = entry_dist };
+        sortedInsertDesc(c_items, &c_len, entry_item);
+        sortedInsertAsc(w_items, &w_len, ef, entry_item);
+        markVisited(&bloom, visited, entry, mark);
+
+        while (c_len > 0) {
+            const current = sortedPopMin(c_items, &c_len);
+            if (w_len >= ef and current.distance > sortedWorstDist(w_items, w_len)) break;
+
+            if (layer > self.nodes.items[current.idx].level) continue;
+            const connections = self.getConnections(current.idx, layer);
+
+            const pf_count = @min(connections.len, 8);
+            for (connections[0..pf_count]) |neighbor| {
+                const vec = storage.getVector(neighbor);
+                @prefetch(vec.ptr, .{ .rw = .read, .locality = 0, .cache = .data });
+                @prefetch(@as([*]const u8, @ptrCast(&self.nodes.items[neighbor])), .{ .rw = .read, .locality = 1, .cache = .data });
             }
-        }.lessThan);
+
+            for (connections, 0..) |neighbor, ci| {
+                if (isVisited(&bloom, visited, neighbor, mark)) continue;
+                markVisited(&bloom, visited, neighbor, mark);
+
+                if (ci + pf_count < connections.len) {
+                    const ahead_id = connections[ci + pf_count];
+                    const ahead = storage.getVector(ahead_id);
+                    @prefetch(ahead.ptr, .{ .rw = .read, .locality = 0, .cache = .data });
+                    @prefetch(@as([*]const u8, @ptrCast(&self.nodes.items[ahead_id])), .{ .rw = .read, .locality = 1, .cache = .data });
+                }
+
+                const qvec = storage.getVector(neighbor);
+                const dot_i32 = VectorOps.dotI8(query_q8, qvec);
+                const dist = 1.0 - @as(f32, @floatFromInt(dot_i32)) * INT8_INV_SCALE_SQ;
+
+                if (w_len < ef or dist < sortedWorstDist(w_items, w_len)) {
+                    sortedInsertDesc(c_items, &c_len, .{ .idx = neighbor, .distance = dist });
+                    sortedInsertAsc(w_items, &w_len, ef, .{ .idx = neighbor, .distance = dist });
+                }
+            }
+        }
 
         return w_items[0..w_len];
     }
@@ -2838,85 +2901,115 @@ pub const VectorDB = struct {
         return if (scale > 0) 1.0 / scale else 1.0;
     }
 
-    /// PQ4 asymmetric distance using NEON tbl in-register lookup.
-    /// Each subvector's 16-entry u8 table fits in one 128-bit register.
-    /// The 4-bit codes index directly into the table via tbl instruction.
-    inline fn pq4DistanceADC(self: *const VectorDB, dist_table: []const u8, vec_idx: usize) u32 {
+    /// SIMD-batched PQ4 distance: compute distances for up to 16 vectors simultaneously.
+    /// Each lane of a 128-bit register processes a different vector's code through
+    /// the same distance table, fully utilizing tbl (NEON) / pshufb (x86) throughput.
+    fn pq4DistanceBatch16(
+        self: *const VectorDB,
+        dist_table: []const u8,
+        vec_indices: []const usize,
+        out_dists: *[16]u32,
+    ) void {
         const pq4_m = self.pq4_m;
         const half_m = pq4_m / 2;
-        const codes = self.pq4_codes[vec_idx * half_m ..][0..half_m];
+        const batch_len = vec_indices.len;
 
-        if (comptime builtin.cpu.arch == .aarch64) {
-            return pq4DistanceNeon(dist_table, codes, pq4_m);
-        }
-        return pq4DistanceGeneric(dist_table, codes, pq4_m);
-    }
+        // Pad indices to 16 (extra lanes do harmless duplicate work)
+        var idxs: [16]usize = undefined;
+        for (0..16) |i| idxs[i] = if (i < batch_len) vec_indices[i] else vec_indices[0];
 
-    fn pq4DistanceNeon(dist_table: []const u8, codes: []const u8, pq4_m: usize) u32 {
-        const half_m = pq4_m / 2;
-        var sum: u32 = 0;
+        var sums: @Vector(16, u16) = @splat(0);
 
-        // Process 2 subvectors at a time (1 byte = 2 packed nibbles)
         for (0..half_m) |i| {
-            const byte = codes[i];
-            const code_lo: u8 = byte & 0x0F;
-            const code_hi: u8 = byte >> 4;
-            const m_lo = i * 2;
-            const m_hi = m_lo + 1;
+            // Gather code bytes for 16 vectors
+            var code_bytes: @Vector(16, u8) = undefined;
+            inline for (0..16) |v| {
+                code_bytes[v] = self.pq4_codes[idxs[v] * half_m + i];
+            }
 
-            // Load 16-byte distance tables into NEON registers
-            const table_lo: @Vector(16, u8) = dist_table[m_lo * 16 ..][0..16].*;
-            const table_hi: @Vector(16, u8) = dist_table[m_hi * 16 ..][0..16].*;
+            const code_lo = code_bytes & @as(@Vector(16, u8), @splat(0x0F));
+            const code_hi = code_bytes >> @as(@Vector(16, u8), @splat(4));
 
-            // Use tbl for in-register lookup (index vector with single code byte)
-            var idx_lo: @Vector(16, u8) = @splat(0xFF); // Invalid indices → 0 output
-            idx_lo[0] = code_lo;
-            var idx_hi: @Vector(16, u8) = @splat(0xFF);
-            idx_hi[0] = code_hi;
+            // Load 16-byte distance tables for this pair of subvectors
+            const t_lo: @Vector(16, u8) = dist_table[(i * 2) * 16 ..][0..16].*;
+            const t_hi: @Vector(16, u8) = dist_table[(i * 2 + 1) * 16 ..][0..16].*;
 
-            // ARM tbl: lookup table_lo[idx_lo[i]] for each i
-            // Indices >= 16 return 0, so only slot 0 has a valid result
-            const result_lo = asm ("tbl %[d].16b, {%[n].16b}, %[m].16b"
-                : [d] "=w" (-> @Vector(16, u8))
-                : [n] "w" (table_lo), [m] "w" (idx_lo),
-            );
-            const result_hi = asm ("tbl %[d].16b, {%[n].16b}, %[m].16b"
-                : [d] "=w" (-> @Vector(16, u8))
-                : [n] "w" (table_hi), [m] "w" (idx_hi),
-            );
+            var dists_lo: @Vector(16, u8) = undefined;
+            var dists_hi: @Vector(16, u8) = undefined;
 
-            sum += @as(u32, result_lo[0]) + @as(u32, result_hi[0]);
+            if (comptime builtin.cpu.arch == .aarch64) {
+                dists_lo = asm ("tbl %[d].16b, {%[n].16b}, %[m].16b"
+                    : [d] "=w" (-> @Vector(16, u8))
+                    : [n] "w" (t_lo), [m] "w" (code_lo),
+                );
+                dists_hi = asm ("tbl %[d].16b, {%[n].16b}, %[m].16b"
+                    : [d] "=w" (-> @Vector(16, u8))
+                    : [n] "w" (t_hi), [m] "w" (code_hi),
+                );
+            } else if (comptime builtin.cpu.arch == .x86_64) {
+                dists_lo = asm ("pshufb %[mask], %[dest]"
+                    : [dest] "=x" (-> @Vector(16, u8))
+                    : [dest] "0" (t_lo), [mask] "x" (code_lo),
+                );
+                dists_hi = asm ("pshufb %[mask], %[dest]"
+                    : [dest] "=x" (-> @Vector(16, u8))
+                    : [dest] "0" (t_hi), [mask] "x" (code_hi),
+                );
+            } else {
+                inline for (0..16) |v| dists_lo[v] = t_lo[code_lo[v]];
+                inline for (0..16) |v| dists_hi[v] = t_hi[code_hi[v]];
+            }
+
+            sums += @as(@Vector(16, u16), dists_lo);
+            sums += @as(@Vector(16, u16), dists_hi);
         }
 
         // Handle odd subvector count
         if (pq4_m % 2 == 1) {
             const last_m = pq4_m - 1;
-            const byte = codes[half_m - 1];
-            const code: u8 = byte & 0x0F;
-            sum += dist_table[last_m * 16 + code];
+            const t_odd: @Vector(16, u8) = dist_table[last_m * 16 ..][0..16].*;
+            var code_bytes: @Vector(16, u8) = undefined;
+            inline for (0..16) |v| {
+                code_bytes[v] = self.pq4_codes[idxs[v] * half_m + half_m - 1];
+            }
+            const code_odd = code_bytes & @as(@Vector(16, u8), @splat(0x0F));
+
+            var dists_odd: @Vector(16, u8) = undefined;
+            if (comptime builtin.cpu.arch == .aarch64) {
+                dists_odd = asm ("tbl %[d].16b, {%[n].16b}, %[m].16b"
+                    : [d] "=w" (-> @Vector(16, u8))
+                    : [n] "w" (t_odd), [m] "w" (code_odd),
+                );
+            } else if (comptime builtin.cpu.arch == .x86_64) {
+                dists_odd = asm ("pshufb %[mask], %[dest]"
+                    : [dest] "=x" (-> @Vector(16, u8))
+                    : [dest] "0" (t_odd), [mask] "x" (code_odd),
+                );
+            } else {
+                inline for (0..16) |v| dists_odd[v] = t_odd[code_odd[v]];
+            }
+            sums += @as(@Vector(16, u16), dists_odd);
         }
 
-        return sum;
+        inline for (0..16) |v| {
+            out_dists[v] = sums[v];
+        }
     }
 
-    fn pq4DistanceGeneric(dist_table: []const u8, codes: []const u8, pq4_m: usize) u32 {
+    /// Single-vector PQ4 distance fallback (used when batch not applicable).
+    inline fn pq4DistanceADC(self: *const VectorDB, dist_table: []const u8, vec_idx: usize) u32 {
+        const pq4_m = self.pq4_m;
         const half_m = pq4_m / 2;
+        const codes = self.pq4_codes[vec_idx * half_m ..][0..half_m];
         var sum: u32 = 0;
-
         for (0..half_m) |i| {
             const byte = codes[i];
-            const code_lo: u8 = byte & 0x0F;
-            const code_hi: u8 = byte >> 4;
-            sum += dist_table[i * 2 * 16 + code_lo];
-            sum += dist_table[(i * 2 + 1) * 16 + code_hi];
+            sum += dist_table[i * 2 * 16 + (byte & 0x0F)];
+            sum += dist_table[(i * 2 + 1) * 16 + (byte >> 4)];
         }
-
         if (pq4_m % 2 == 1) {
-            const last_m = pq4_m - 1;
-            const byte = codes[half_m - 1];
-            sum += dist_table[last_m * 16 + (byte & 0x0F)];
+            sum += dist_table[(pq4_m - 1) * 16 + (codes[half_m - 1] & 0x0F)];
         }
-
         return sum;
     }
 
@@ -3096,10 +3189,32 @@ pub const VectorDB = struct {
         return &[_]f32{};
     }
 
+    inline fn distanceToStored(self: *VectorDB, normalized_query: []const f32, query_q8: []const i8, idx: usize) f32 {
+        if (comptime StorageScalar == i8) {
+            const dot_i32 = VectorOps.dotI8(query_q8, self.storage.getVector(idx));
+            return 1.0 - @as(f32, @floatFromInt(dot_i32)) * INT8_INV_SCALE_SQ;
+        }
+        return VectorOps.cosineDistanceQueryStorage(normalized_query, self.storage.getVector(idx));
+    }
+
     fn searchBruteForce(self: *VectorDB, normalized_query: []const f32, k: usize) ![]SearchResult {
         const result_len = @min(k, self.storage.count);
         var results = try self.allocator.alloc(SearchResult, result_len);
         if (result_len == 0) return results;
+
+        var query_q8_stack: [2048]i8 = undefined;
+        var query_q8_heap: []i8 = &[_]i8{};
+        defer if (query_q8_heap.len > 0) self.allocator.free(query_q8_heap);
+        const query_q8: []const i8 = if (comptime StorageScalar == i8) blk: {
+            const buf = if (normalized_query.len <= query_q8_stack.len) stack: {
+                break :stack query_q8_stack[0..normalized_query.len];
+            } else heap: {
+                query_q8_heap = try self.allocator.alloc(i8, normalized_query.len);
+                break :heap query_q8_heap;
+            };
+            VectorOps.quantizeBatch(normalized_query, buf);
+            break :blk buf;
+        } else &[_]i8{};
 
         var filled: usize = 0;
         var worst_pos: usize = 0;
@@ -3107,7 +3222,7 @@ pub const VectorDB = struct {
 
         var idx: usize = 0;
         while (idx < self.storage.count) : (idx += 1) {
-            const dist = VectorOps.cosineDistanceQueryStorage(normalized_query, self.storage.getVector(idx));
+            const dist = self.distanceToStored(normalized_query, query_q8, idx);
 
             if (filled < result_len) {
                 results[filled] = .{
@@ -3157,10 +3272,27 @@ pub const VectorDB = struct {
             return try self.allocator.alloc(SearchResult, 0);
         }
 
+        var query_q8_stack: [2048]i8 = undefined;
+        var query_q8_heap: []i8 = &[_]i8{};
+        defer if (query_q8_heap.len > 0) self.allocator.free(query_q8_heap);
+        const query_q8: []const i8 = if (comptime StorageScalar == i8) blk: {
+            const buf = if (normalized_query.len <= query_q8_stack.len) stack: {
+                break :stack query_q8_stack[0..normalized_query.len];
+            } else heap: {
+                query_q8_heap = try self.allocator.alloc(i8, normalized_query.len);
+                break :heap query_q8_heap;
+            };
+            VectorOps.quantizeBatch(normalized_query, buf);
+            break :blk buf;
+        } else &[_]i8{};
+
         const ef = @max(k * 4, self.search_ef);
         self.index.build_rwlock.lockShared();
         defer self.index.build_rwlock.unlockShared();
-        const items = try self.index.searchLayer(normalized_query, self.index.entry_point.?, ef, 0, &self.storage);
+        const items = if (comptime StorageScalar == i8)
+            try self.index.searchLayerStorageI8(query_q8, self.index.entry_point.?, ef, 0, &self.storage)
+        else
+            try self.index.searchLayer(normalized_query, self.index.entry_point.?, ef, 0, &self.storage);
         // items is a slice into context buffer – no deallocation needed
 
         const result_len = @min(k, items.len);
@@ -3188,13 +3320,9 @@ pub const VectorDB = struct {
         };
 
         const nlist = self.ivf_offsets.len;
-        // Adaptive probe scaling: aggressive probing only when user demands high recall.
-        // Low ef = throughput mode (few probes), high ef = recall mode (many probes).
-        // IVF probing is cheap (int8) vs HNSW assist (f32), so probe aggressively.
-        const adaptive_probes = if (self.search_ef >= 256)
-            self.search_ef / 5
-        else
-            self.search_ef / 32;
+        // Smooth probe scaling: ef directly controls coverage.
+        // ef=32 -> 10, ef=64 -> 21, ef=128 -> 42, ef=256 -> 85
+        const adaptive_probes = self.search_ef / 3;
         const probes = std.math.clamp(@max(self.ivf_probes, adaptive_probes), 1, nlist);
         if (probes == 0) return self.searchHnsw(normalized_query, k);
 
@@ -3294,6 +3422,7 @@ pub const VectorDB = struct {
         const use_threads = total_candidates >= 50_000;
 
         // ── Fast single-threaded path: fused IVF scan + rerank (zero intermediate alloc) ──
+        // Includes lightweight HNSW graph walk to catch neighbors missed by IVF clustering.
         if (!use_threads and !use_hnsw_assist) {
             const dim = self.storage.dimension;
             const heap_k = @min(k, total_candidates);
@@ -3304,7 +3433,7 @@ pub const VectorDB = struct {
             var threshold: f32 = std.math.inf(f32);
 
             // Margin for int8 quantization error: empirically ~0.05 at 768d
-            const INT8_MARGIN: f32 = 0.08;
+            const INT8_MARGIN: f32 = 0.12;
             // Hamming pre-filter: adapted from current cosine threshold.
             // Relationship: hamming ≈ dim * arccos(1 - cos_dist) / π + margin
             // We use a generous margin (1.3x) to avoid false rejections.
@@ -3313,97 +3442,108 @@ pub const VectorDB = struct {
             var hamming_reject: u32 = hamming_max;
 
             for (probe_lists[0..probe_len]) |probe| {
-                const offset = self.ivf_offsets[probe.idx];
+                const list_offset = self.ivf_offsets[probe.idx];
                 const list_len = self.ivf_lengths[probe.idx];
 
                 // Prefetch first few quantized vectors ahead of the scan
                 const PF_DEPTH = 4;
                 for (0..@min(PF_DEPTH, list_len)) |pf| {
-                    const pf_idx = self.ivf_postings[offset + pf];
+                    const pf_idx = self.ivf_postings[list_offset + pf];
                     @prefetch(self.quantized_vectors.ptr + pf_idx * dim, .{ .rw = .read, .locality = 1, .cache = .data });
                 }
 
                 var j: usize = 0;
-                while (j < list_len) : (j += 1) {
-                    // Prefetch quantized vector PF_DEPTH positions ahead
-                    if (j + PF_DEPTH < list_len) {
-                        const ahead_idx = self.ivf_postings[offset + j + PF_DEPTH];
-                        @prefetch(self.quantized_vectors.ptr + ahead_idx * dim, .{ .rw = .read, .locality = 1, .cache = .data });
-                    }
+                while (j < list_len) {
+                    // ── Gather batch of up to 16 candidates surviving binary filter ──
+                    var batch_idxs: [16]usize = undefined;
+                    var batch_len: usize = 0;
 
-                    const idx = self.ivf_postings[offset + j];
-
-                    // Level 0: Binary Hamming pre-filter (ultra-cheap: ~12 XOR + popcount)
-                    if (has_binary and heap_len >= heap_k and threshold < 0.6) {
-                        const bvec = self.binary_vectors[idx * bwords ..][0..bwords];
-                        const hamming = VectorOps.hammingDistance(query_bin, bvec);
-                        if (hamming > hamming_reject) continue;
-                    }
-
-                    // Level 0.5: PQ4 approximate distance (96 table lookups vs 768 int8 ops)
-                    if (has_pq4 and heap_len >= heap_k) {
-                        const pq4_raw = self.pq4DistanceADC(pq4_table, idx);
-                        const pq4_dist = @as(f32, @floatFromInt(pq4_raw)) * pq4_inv_scale;
-                        // PQ4 returns squared L2; convert to approximate cosine: dist ≈ pq4_l2 * 0.5
-                        if (pq4_dist * 0.5 > threshold + 0.15) continue;
-                    }
-
-                    const qvec = self.quantized_vectors[idx * dim ..][0..dim];
-
-                    // Level 1: int8 approximate distance (fast rejection)
-                    const dot_i32 = VectorOps.dotI8(query_q8, qvec);
-                    const approx_dist = 1.0 - @as(f32, @floatFromInt(dot_i32)) * INT8_INV_SCALE_SQ;
-
-                    if (heap_len >= heap_k and approx_dist > threshold + INT8_MARGIN) continue;
-
-                    // Level 2: exact f32 distance (only for promising candidates)
-                    // Prefetch next storage vector for reranking
-                    if (j + 1 < list_len) {
-                        const next_idx = self.ivf_postings[offset + j + 1];
-                        const next_vec = self.storage.getVector(next_idx);
-                        @prefetch(next_vec.ptr, .{ .rw = .read, .locality = 0, .cache = .data });
-                    }
-                    const dist = VectorOps.cosineDistanceQueryStorage(normalized_query, self.storage.getVector(idx));
-
-                    if (heap_len < heap_k) {
-                        heap[heap_len] = .{ .idx = idx, .distance = dist, .vector = self.resultVectorSlice(idx) };
-                        var pos = heap_len;
-                        while (pos > 0) {
-                            const parent = (pos - 1) / 2;
-                            if (heap[pos].distance > heap[parent].distance) {
-                                const tmp = heap[pos];
-                                heap[pos] = heap[parent];
-                                heap[parent] = tmp;
-                                pos = parent;
-                            } else break;
+                    while (j < list_len and batch_len < 16) : (j += 1) {
+                        // Prefetch quantized vector PF_DEPTH positions ahead
+                        if (j + PF_DEPTH < list_len) {
+                            const ahead_idx = self.ivf_postings[list_offset + j + PF_DEPTH];
+                            @prefetch(self.quantized_vectors.ptr + ahead_idx * dim, .{ .rw = .read, .locality = 1, .cache = .data });
                         }
-                        heap_len += 1;
-                        if (heap_len == heap_k) {
+
+                        const idx = self.ivf_postings[list_offset + j];
+
+                        // Level 0: Binary Hamming pre-filter
+                        if (has_binary and heap_len >= heap_k and threshold < 0.6) {
+                            const bvec = self.binary_vectors[idx * bwords ..][0..bwords];
+                            if (VectorOps.hammingDistance(query_bin, bvec) > hamming_reject) continue;
+                        }
+                        batch_idxs[batch_len] = idx;
+                        batch_len += 1;
+                    }
+
+                    if (batch_len == 0) continue;
+
+                    // ── Level 0.5: SIMD-batched PQ4 distances (16 vectors at once) ──
+                    var batch_pq4_dists: [16]u32 = undefined;
+                    if (has_pq4 and heap_len >= heap_k) {
+                        self.pq4DistanceBatch16(pq4_table, batch_idxs[0..batch_len], &batch_pq4_dists);
+                    }
+
+                    // ── Process surviving candidates through int8 → f32 cascade ──
+                    for (0..batch_len) |b| {
+                        const idx = batch_idxs[b];
+
+                        // Apply batched PQ4 filter
+                        if (has_pq4 and heap_len >= heap_k) {
+                            const pq4_dist = @as(f32, @floatFromInt(batch_pq4_dists[b])) * pq4_inv_scale;
+                            if (pq4_dist * 0.5 > threshold + 0.30) continue;
+                        }
+
+                        const qvec = self.quantized_vectors[idx * dim ..][0..dim];
+
+                        // Level 1: int8 approximate distance (fast rejection)
+                        const dot_i32 = VectorOps.dotI8(query_q8, qvec);
+                        const approx_dist = 1.0 - @as(f32, @floatFromInt(dot_i32)) * INT8_INV_SCALE_SQ;
+
+                        if (heap_len >= heap_k and approx_dist > threshold + INT8_MARGIN) continue;
+
+                        // Level 2: exact f32 distance (only for promising candidates)
+                        const dist = self.distanceToStored(normalized_query, query_q8, idx);
+
+                        if (heap_len < heap_k) {
+                            heap[heap_len] = .{ .idx = idx, .distance = dist, .vector = self.resultVectorSlice(idx) };
+                            var pos = heap_len;
+                            while (pos > 0) {
+                                const parent = (pos - 1) / 2;
+                                if (heap[pos].distance > heap[parent].distance) {
+                                    const tmp = heap[pos];
+                                    heap[pos] = heap[parent];
+                                    heap[parent] = tmp;
+                                    pos = parent;
+                                } else break;
+                            }
+                            heap_len += 1;
+                            if (heap_len == heap_k) {
+                                threshold = heap[0].distance;
+                                const cos_sim = std.math.clamp(1.0 - threshold, -1.0, 1.0);
+                                const angle = std.math.acos(cos_sim);
+                                hamming_reject = @min(hamming_max, @as(u32, @intFromFloat(angle / std.math.pi * dim_f * 1.3)));
+                            }
+                        } else if (dist < heap[0].distance) {
+                            heap[0] = .{ .idx = idx, .distance = dist, .vector = self.resultVectorSlice(idx) };
+                            var pos: usize = 0;
+                            while (true) {
+                                const left = 2 * pos + 1;
+                                const right = 2 * pos + 2;
+                                var largest = pos;
+                                if (left < heap_len and heap[left].distance > heap[largest].distance) largest = left;
+                                if (right < heap_len and heap[right].distance > heap[largest].distance) largest = right;
+                                if (largest == pos) break;
+                                const tmp = heap[pos];
+                                heap[pos] = heap[largest];
+                                heap[largest] = tmp;
+                                pos = largest;
+                            }
                             threshold = heap[0].distance;
-                            // Update adaptive Hamming threshold: arccos(1-d)/π * dim * 1.3 margin
                             const cos_sim = std.math.clamp(1.0 - threshold, -1.0, 1.0);
                             const angle = std.math.acos(cos_sim);
                             hamming_reject = @min(hamming_max, @as(u32, @intFromFloat(angle / std.math.pi * dim_f * 1.3)));
                         }
-                    } else if (dist < heap[0].distance) {
-                        heap[0] = .{ .idx = idx, .distance = dist, .vector = self.resultVectorSlice(idx) };
-                        var pos: usize = 0;
-                        while (true) {
-                            const left = 2 * pos + 1;
-                            const right = 2 * pos + 2;
-                            var largest = pos;
-                            if (left < heap_len and heap[left].distance > heap[largest].distance) largest = left;
-                            if (right < heap_len and heap[right].distance > heap[largest].distance) largest = right;
-                            if (largest == pos) break;
-                            const tmp = heap[pos];
-                            heap[pos] = heap[largest];
-                            heap[largest] = tmp;
-                            pos = largest;
-                        }
-                        threshold = heap[0].distance;
-                        const cos_sim = std.math.clamp(1.0 - threshold, -1.0, 1.0);
-                        const angle = std.math.acos(cos_sim);
-                        hamming_reject = @min(hamming_max, @as(u32, @intFromFloat(angle / std.math.pi * dim_f * 1.3)));
                     }
                 }
             }
@@ -3589,7 +3729,7 @@ pub const VectorDB = struct {
                 const next_vec = self.storage.getVector(approx_candidates[i + 1].idx);
                 @prefetch(next_vec.ptr, .{ .rw = .read, .locality = 0, .cache = .data });
             }
-            const dist = VectorOps.cosineDistanceQueryStorage(normalized_query, self.storage.getVector(cand.idx));
+            const dist = self.distanceToStored(normalized_query, query_q8, cand.idx);
 
             if (heap_len < heap_k) {
                 heap[heap_len] = .{ .idx = cand.idx, .distance = dist, .vector = self.resultVectorSlice(cand.idx) };
@@ -4203,8 +4343,10 @@ test "addBatch validates dimensions" {
 
 test "turbo IVF uses mmap postings for file-backed mode" {
     const allocator = std.testing.allocator;
-    const data_path = "turbo_vectors_test.db";
-    const postings_path = "turbo_vectors_test.db.ivf.postings";
+    const data_path = try std.fmt.allocPrint(allocator, "turbo_vectors_test_{s}.db", .{STORAGE_MODE});
+    defer allocator.free(data_path);
+    const postings_path = try std.fmt.allocPrint(allocator, "{s}.ivf.postings", .{data_path});
+    defer allocator.free(postings_path);
     defer fs.cwd().deleteFile(postings_path) catch {};
     defer fs.cwd().deleteFile(data_path) catch {};
 
@@ -4242,4 +4384,90 @@ test "turbo IVF uses mmap postings for file-backed mode" {
 
     const stat = try fs.cwd().statFile(postings_path);
     try std.testing.expect(stat.size >= @as(u64, @intCast(db.storage.count * @sizeOf(usize))));
+}
+
+// ── C-API for Python / FFI Wrapper ─────────────────────────────────────────
+
+var c_api_gpa = std.heap.GeneralPurposeAllocator(.{}){};
+
+export fn zector_init(dim: u32, max_elements: u32, m: u32, ef_construction: u32) ?*VectorDB {
+    const allocator = c_api_gpa.allocator();
+    const db = allocator.create(VectorDB) catch return null;
+    db.* = VectorDB.init(allocator, @intCast(dim), .{
+        .initial_capacity = @intCast(max_elements),
+        .index_m = @intCast(m),
+        .index_ef_construction = @intCast(ef_construction),
+    }) catch {
+        allocator.destroy(db);
+        return null;
+    };
+    return db;
+}
+
+export fn zector_free(db: *VectorDB) void {
+    const allocator = db.allocator;
+    db.deinit();
+    allocator.destroy(db);
+}
+
+export fn zector_add(db: *VectorDB, vec_data: [*]const f32) i64 {
+    const dim = db.storage.dimension;
+    const vec = vec_data[0..dim];
+    const idx = db.addVector(vec, null) catch return -1;
+    return @intCast(idx);
+}
+
+export fn zector_add_batch(db: *VectorDB, vec_data: [*]const f32, count: u32) i32 {
+    const dim = db.storage.dimension;
+    const n: usize = @intCast(count);
+    const allocator = db.allocator;
+
+    // Build slice-of-slices pointing into the contiguous input buffer
+    const slices = allocator.alloc([]const f32, n) catch return -1;
+    defer allocator.free(slices);
+    for (0..n) |i| {
+        slices[i] = vec_data[i * dim ..][0..dim];
+    }
+    db.addBatch(slices) catch return -1;
+    return 0;
+}
+
+export fn zector_build_index(db: *VectorDB) i32 {
+    db.rebuildTurboIndex() catch return -1;
+    return 0;
+}
+
+export fn zector_set_search_ef(db: *VectorDB, ef: u32) void {
+    db.setSearchEf(@intCast(ef));
+}
+
+export fn zector_set_turbo_enabled(db: *VectorDB, enabled: bool) void {
+    db.turbo_enabled = enabled;
+}
+
+export fn zector_search(
+    db: *VectorDB,
+    query_data: [*]const f32,
+    k: u32,
+    out_ids: [*]u64,
+    out_dists: [*]f32,
+) i32 {
+    const dim = db.storage.dimension;
+    const query = query_data[0..dim];
+    const results = db.search(query, @intCast(k)) catch return -1;
+    defer db.allocator.free(results);
+
+    for (results, 0..) |res, i| {
+        out_ids[i] = @intCast(res.idx);
+        out_dists[i] = res.distance;
+    }
+    return @intCast(results.len);
+}
+
+export fn zector_count(db: *VectorDB) u64 {
+    return @intCast(db.storage.count);
+}
+
+export fn zector_dimension(db: *VectorDB) u32 {
+    return @intCast(db.storage.dimension);
 }

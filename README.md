@@ -22,29 +22,44 @@ High-performance vector search library/database in Zig, designed around cache lo
 ## Quick start
 
 ```bash
-zig build run -Doptimize=ReleaseFast
+zig build run -Doptimize=ReleaseFast -Dstorage=sq8
 zig build benchmark
 zig build test
 ```
+
+Storage modes:
+
+- `-Dstorage=f32`: full precision storage.
+- `-Dstorage=f16`: half precision storage for lower bandwidth.
+- `-Dstorage=sq8`: scalar-quantized int8 storage for the fastest memory-bound path.
+
+Benchmark controls:
+
+```bash
+ZECTOR_MAX_THREADS=4 ZECTOR_DEMO_VECTORS=50000 zig build run -Doptimize=ReleaseFast -Dstorage=sq8
+```
+
+`ZECTOR_MAX_THREADS` caps worker threads so local runs do not saturate the machine. `ZECTOR_DEMO_VECTORS` changes the demo dataset size.
 
 ## Local benchmark snapshot
 
 Environment:
 
-- Date (UTC): `2026-02-18`
+- Date: `2026-04-27`
 - Zig: `0.14.0`
-- Target: `aarch64-macos` (Apple M3 Max, 16 cores)
+- Target: `aarch64-macos`
 
-### Demo run (`zig build run -Doptimize=ReleaseFast`)
+### Controlled demo run
 
-Workload: random `100,000` vectors, dimension `768`, `100` queries, `k=10`.
+Workload: random vectors, dimension `768`, `100` queries, `k=10`, `ZECTOR_MAX_THREADS=4`.
 
-| Metric | Result |
-|---|---:|
-| Build time (HNSW + IVF) | `11,039 ms` |
-| Ingest throughput | `9,058 vectors/sec` |
-| Single-thread search | `1,315 QPS` |
-| Multi-thread batch search | `10,000 QPS` |
+| Storage | Vectors | Build | Throughput | Single QPS | Batch QPS |
+|---|---:|---:|---:|---:|---:|
+| `f32` | `50,000` | `7,666 ms` | `6,522 v/s` | `282` | `1,030` |
+| `f16` | `50,000` | `8,374 ms` | `5,970 v/s` | `284` | `917` |
+| `sq8` | `50,000` | `5,370 ms` | `9,310 v/s` | `497` | `1,818` |
+
+On the same capped `10,000` vector run, `sq8` reached `13,071 v/s` build throughput, `4,166` single-query QPS, and `12,500` batch QPS.
 
 ### Benchmark harness (`zig build benchmark`)
 
@@ -55,6 +70,32 @@ High-recall mode (M=48, ef_construction=600, search_ef=512):
 | Small (1K, 128d) | `113 ms` | `8,850 v/s` | `113 us` | `8,726` | `100%` |
 | Medium (10K, 384d) | `530 ms` | `18,868 v/s` | `1,569 us` | `637` | `100%` |
 | Large (50K, 768d) | `59,674 ms` | `838 v/s` | `16,585 us` | `60` | `95.7%` |
+
+### NYTimes HDF5 benchmark
+
+Workload: `nytimes-256-angular.hdf5`, `290,000` train vectors, `200` queries, `k=10`, `ZECTOR_MAX_THREADS=4`, `M=32`, `ef_construction=400`.
+
+```bash
+zig build shared -Doptimize=ReleaseFast -Dstorage=sq8
+.venv/bin/python real_bench.py --limit 0 --queries 200 --threads 4 --efs 128,256,512 --m 32 --ef-construction 400 --disable-turbo
+zig build shared -Doptimize=ReleaseFast -Dstorage=f32
+.venv/bin/python real_bench.py --limit 0 --queries 200 --threads 4 --efs 128,256,512 --m 32 --ef-construction 400 --disable-turbo
+.venv/bin/python hnswlib_bench.py --limit 0 --queries 200 --threads 4 --efs 128,256,512 --m 32 --ef-construction 400
+```
+
+| Engine | Build | Build throughput | ef | Recall@10 | QPS | p99 |
+|---|---:|---:|---:|---:|---:|---:|
+| Zector SQ8 HNSW only | `74.28s` | `3,904 v/s` | `128` | `85.4%` | `4,524` | `414 us` |
+| Zector SQ8 HNSW only | `74.28s` | `3,904 v/s` | `256` | `90.3%` | `2,335` | `684 us` |
+| Zector SQ8 HNSW only | `74.28s` | `3,904 v/s` | `512` | `92.2%` | `1,121` | `1,269 us` |
+| Zector f32 HNSW only | `184.00s` | `1,576 v/s` | `128` | `87.8%` | `1,700` | `1,126 us` |
+| Zector f32 HNSW only | `184.00s` | `1,576 v/s` | `256` | `91.8%` | `936` | `1,796 us` |
+| Zector f32 HNSW only | `184.00s` | `1,576 v/s` | `512` | `95.8%` | `426` | `3,861 us` |
+| hnswlib cosine | `331.49s` | `875 v/s` | `128` | `94.1%` | `967` | `1,521 us` |
+| hnswlib cosine | `331.49s` | `875 v/s` | `256` | `95.7%` | `517` | `2,529 us` |
+| hnswlib cosine | `331.49s` | `875 v/s` | `512` | `97.3%` | `266` | `4,767 us` |
+
+Interpretation: SQ8 is the fast low-latency mode, while f32 is the high-recall mode. Zector builds faster than hnswlib on this dataset; hnswlib still has better recall at the same `ef`, while Zector's f32 mode reaches comparable mid-95% recall with faster build time.
 
 ## Online comparisons (public benchmark references)
 
