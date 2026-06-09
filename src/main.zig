@@ -1406,7 +1406,6 @@ const HNSWIndex = struct {
         dist: f32, // distance(node, neighbor)
         storage: *const VectorStorage, // for computing distances during pruning
     ) !void {
-        _ = storage; // Not needed here since connection distances are cached.
         const node = &self.nodes.items[node_idx];
         if (level > node.level) return; // node has no such layer
 
@@ -1459,18 +1458,43 @@ const HNSWIndex = struct {
             self.distance_pool.items[offset + insert_pos] = dist;
             conn.len += 1;
         } else {
-            // Already full - if new distance is worse than the current worst, ignore.
-            if (insert_pos == conn.capacity) return;
+            // Full — re-select with the diversity heuristic over existing
+            // edges + the new candidate (hnswlib-style shrink). Keeping only
+            // the nearest edges here creates clustered hubs with no
+            // long-range links and collapses recall at scale.
+            var merged_buf: [257]SearchItem = undefined;
+            const mlen = conn.len + 1;
+            if (mlen > merged_buf.len) return; // cannot happen for sane m
 
-            // Otherwise insert and drop the last (worst) entry.
-            var j: usize = conn.capacity - 1;
-            while (j > insert_pos) : (j -= 1) {
-                self.edge_pool.items[offset + j] = self.edge_pool.items[offset + j - 1];
-                self.distance_pool.items[offset + j] = self.distance_pool.items[offset + j - 1];
+            var src: usize = 0;
+            for (0..mlen) |d| {
+                if (d == insert_pos) {
+                    merged_buf[d] = .{ .idx = neighbor_idx, .distance = dist };
+                } else {
+                    merged_buf[d] = .{
+                        .idx = self.edge_pool.items[offset + src],
+                        .distance = self.distance_pool.items[offset + src],
+                    };
+                    src += 1;
+                }
             }
-            self.edge_pool.items[offset + insert_pos] = neighbor_idx;
-            self.distance_pool.items[offset + insert_pos] = dist;
-            // conn.len stays at capacity.
+
+            const keep = self.selectNeighborsHeuristic(merged_buf[0..mlen], conn.capacity, storage);
+
+            // Heuristic bubbles kept items to the front but may break global
+            // ordering (backfill); restore ascending-by-distance order.
+            std.sort.insertion(SearchItem, merged_buf[0..keep], {}, struct {
+                fn lessThan(context: void, a: SearchItem, b: SearchItem) bool {
+                    _ = context;
+                    return a.distance < b.distance;
+                }
+            }.lessThan);
+
+            for (merged_buf[0..keep], 0..) |item, d| {
+                self.edge_pool.items[offset + d] = item.idx;
+                self.distance_pool.items[offset + d] = item.distance;
+            }
+            conn.len = keep;
         }
     }
 
@@ -1533,7 +1557,7 @@ const HNSWIndex = struct {
                 const sel_vec = storage.getVector(selected.idx);
                 const dist_to_selected = VectorOps.cosineDistanceStorage(cand_vec, sel_vec);
 
-                if (dist_to_selected < cand.distance * 1.2) {
+                if (dist_to_selected < cand.distance) {
                     discard = true;
                     break;
                 }
@@ -3308,6 +3332,109 @@ pub const VectorDB = struct {
         return results;
     }
 
+    /// Quantized-graph search: greedy descent through the upper HNSW layers and
+    /// a layer-0 search, both over int8 codes (4x less memory traffic + NEON sdot
+    /// vs f32), then an exact rerank of the surviving candidates.
+    fn searchGraphQuantized(self: *VectorDB, normalized_query: []const f32, k: usize) ![]SearchResult {
+        const dim = self.storage.dimension;
+        const qv = self.quantized_vectors;
+
+        var query_q8_stack: [2048]i8 = undefined;
+        const query_q8 = if (dim <= query_q8_stack.len)
+            query_q8_stack[0..dim]
+        else
+            try self.allocator.alloc(i8, dim);
+        defer if (dim > query_q8_stack.len) self.allocator.free(query_q8);
+        VectorOps.quantizeBatch(normalized_query, query_q8);
+
+        self.index.build_rwlock.lockShared();
+        defer self.index.build_rwlock.unlockShared();
+
+        // Greedy descent: find a good layer-0 entry point with cheap i8 hops.
+        var entry = self.index.entry_point.?;
+        var entry_dist: f32 = blk: {
+            const dot = VectorOps.dotI8(query_q8, qv[entry * dim ..][0..dim]);
+            break :blk 1.0 - @as(f32, @floatFromInt(dot)) * INT8_INV_SCALE_SQ;
+        };
+        var level: usize = self.index.nodes.items[entry].level;
+        while (level > 0) : (level -= 1) {
+            var changed = true;
+            while (changed) {
+                changed = false;
+                const connections = self.index.getConnections(entry, level);
+                for (connections) |neighbor| {
+                    const dot = VectorOps.dotI8(query_q8, qv[neighbor * dim ..][0..dim]);
+                    const dist = 1.0 - @as(f32, @floatFromInt(dot)) * INT8_INV_SCALE_SQ;
+                    if (dist < entry_dist) {
+                        entry_dist = dist;
+                        entry = neighbor;
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        const ef = @max(self.search_ef, k);
+        const items = try self.index.searchLayerI8(query_q8, qv, dim, entry, ef, 0);
+        if (items.len == 0) return self.searchHnsw(normalized_query, k);
+
+        // Exact rerank of the i8-ranked candidates.
+        const heap_k = @min(k, items.len);
+        var heap_buf: [64]SearchResult = undefined;
+        const heap = if (heap_k <= 64) heap_buf[0..heap_k] else try self.allocator.alloc(SearchResult, heap_k);
+        defer if (heap_k > 64) self.allocator.free(heap);
+        var heap_len: usize = 0;
+
+        for (items, 0..) |item, i| {
+            if (i + 1 < items.len) {
+                const next_vec = self.storage.getVector(items[i + 1].idx);
+                @prefetch(next_vec.ptr, .{ .rw = .read, .locality = 0, .cache = .data });
+            }
+            const dist = self.distanceToStored(normalized_query, query_q8, item.idx);
+
+            if (heap_len < heap_k) {
+                heap[heap_len] = .{ .idx = item.idx, .distance = dist, .vector = self.resultVectorSlice(item.idx) };
+                var pos = heap_len;
+                while (pos > 0) {
+                    const parent = (pos - 1) / 2;
+                    if (heap[pos].distance > heap[parent].distance) {
+                        const tmp = heap[pos];
+                        heap[pos] = heap[parent];
+                        heap[parent] = tmp;
+                        pos = parent;
+                    } else break;
+                }
+                heap_len += 1;
+            } else if (dist < heap[0].distance) {
+                heap[0] = .{ .idx = item.idx, .distance = dist, .vector = self.resultVectorSlice(item.idx) };
+                var pos: usize = 0;
+                while (true) {
+                    const left = 2 * pos + 1;
+                    const right = 2 * pos + 2;
+                    var largest = pos;
+                    if (left < heap_len and heap[left].distance > heap[largest].distance) largest = left;
+                    if (right < heap_len and heap[right].distance > heap[largest].distance) largest = right;
+                    if (largest == pos) break;
+                    const tmp = heap[pos];
+                    heap[pos] = heap[largest];
+                    heap[largest] = tmp;
+                    pos = largest;
+                }
+            }
+        }
+
+        std.sort.heap(SearchResult, heap[0..heap_len], {}, struct {
+            fn lessThan(context: void, a: SearchResult, b: SearchResult) bool {
+                _ = context;
+                return a.distance < b.distance;
+            }
+        }.lessThan);
+
+        const out = try self.allocator.alloc(SearchResult, heap_len);
+        @memcpy(out, heap[0..heap_len]);
+        return out;
+    }
+
     fn searchTurbo(self: *VectorDB, normalized_query: []const f32, k: usize) ![]SearchResult {
         if (self.turbo_dirty) try self.rebuildTurboIndex();
         if (self.ivf_offsets.len == 0 or self.quantized_vectors.len == 0) {
@@ -3795,9 +3922,15 @@ pub const VectorDB = struct {
 
         const results = if (self.storage.count <= BRUTE_FORCE_THRESHOLD or self.index.entry_point == null)
             try self.searchBruteForce(normalized_query, k)
-        else if (self.turbo_enabled and self.storage.count >= self.ivf_min_vectors)
-            try self.searchTurbo(normalized_query, k)
-        else
+        else if (self.turbo_enabled and self.storage.count >= self.ivf_min_vectors) blk: {
+            if (self.turbo_dirty) try self.rebuildTurboIndex();
+            // Quantized-graph search dominates the IVF scan across the
+            // recall range on real datasets; IVF remains the fallback when
+            // quantized codes are unavailable.
+            if (self.quantized_vectors.len > 0)
+                break :blk try self.searchGraphQuantized(normalized_query, k);
+            break :blk try self.searchTurbo(normalized_query, k);
+        } else
             try self.searchHnsw(normalized_query, k);
 
         // Translate internal physical IDs → external insertion IDs
