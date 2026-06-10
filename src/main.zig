@@ -4815,6 +4815,42 @@ export fn zector_search(
     return @intCast(results.len);
 }
 
+export fn zector_search_batch(
+    db: *VectorDB,
+    queries: [*]const f32,
+    n: u32,
+    k: u32,
+    out_ids: [*]u64,
+    out_dists: [*]f32,
+) i32 {
+    const dim = db.storage.dimension;
+    const nq: usize = n;
+    const kk: usize = k;
+
+    const slices = db.allocator.alloc([]const f32, nq) catch return -1;
+    defer db.allocator.free(slices);
+    for (0..nq) |i| slices[i] = queries[i * dim ..][0..dim];
+
+    const results = db.searchBatch(slices, kk) catch return -1;
+    defer {
+        for (results) |r| db.allocator.free(r);
+        db.allocator.free(results);
+    }
+
+    for (results, 0..) |r, i| {
+        for (r, 0..) |res, j| {
+            out_ids[i * kk + j] = @intCast(res.idx);
+            out_dists[i * kk + j] = res.distance;
+        }
+        var j = r.len;
+        while (j < kk) : (j += 1) {
+            out_ids[i * kk + j] = std.math.maxInt(u64);
+            out_dists[i * kk + j] = std.math.inf(f32);
+        }
+    }
+    return @intCast(nq);
+}
+
 export fn zector_count(db: *VectorDB) u64 {
     return @intCast(db.storage.count);
 }

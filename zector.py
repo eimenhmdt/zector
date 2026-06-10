@@ -54,6 +54,16 @@ _lib.zector_search.argtypes = [
 ]
 _lib.zector_search.restype = ctypes.c_int32
 
+_lib.zector_search_batch.argtypes = [
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_float),
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.POINTER(ctypes.c_uint64),
+    ctypes.POINTER(ctypes.c_float),
+]
+_lib.zector_search_batch.restype = ctypes.c_int32
+
 _lib.zector_count.argtypes = [ctypes.c_void_p]
 _lib.zector_count.restype = ctypes.c_uint64
 
@@ -158,14 +168,26 @@ class ZectorDB:
         return self._out_ids[:found].copy(), self._out_dists[:found].copy()
 
     def batch_search(self, queries, k=10):
-        """Search multiple queries. Returns lists of (ids, dists) per query."""
+        """Search multiple queries in parallel across all cores.
+
+        Returns:
+            (ids, dists) numpy arrays of shape (n, k). Missing slots are
+            filled with id=2**64-1 / dist=inf.
+        """
         qs = np.ascontiguousarray(queries, dtype=np.float32)
         if qs.ndim == 1:
             qs = qs.reshape(1, -1)
-        results = []
-        for i in range(qs.shape[0]):
-            results.append(self.search(qs[i], k))
-        return results
+        if qs.shape[1] != self.dim:
+            raise ValueError(f"Expected dimension {self.dim}, got {qs.shape[1]}")
+        n = qs.shape[0]
+        out_ids = np.empty((n, k), dtype=np.uint64)
+        out_dists = np.empty((n, k), dtype=np.float32)
+        rc = _lib.zector_search_batch(
+            self._ptr, _f32_ptr(qs), n, k, _u64_ptr(out_ids), _f32_ptr(out_dists)
+        )
+        if rc < 0:
+            raise RuntimeError("Batch search failed")
+        return out_ids, out_dists
 
     @property
     def count(self):
