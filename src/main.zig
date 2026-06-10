@@ -2303,6 +2303,10 @@ pub const VectorDB = struct {
     ivf_postings_path: ?[]u8,
     ivf_postings_is_mmap: bool,
     quantized_vectors: []i8,
+    /// Row stride of quantized_vectors: dimension padded up to a multiple of
+    /// 64 so the i8 sdot kernel runs whole unrolled iterations with no tail.
+    /// Pad lanes are zero and contribute nothing to dot products.
+    code_dim: usize,
     binary_vectors: []u64,
     binary_words_per_vec: usize,
     storage_file_path: ?[]u8,
@@ -2370,6 +2374,7 @@ pub const VectorDB = struct {
             .ivf_postings_path = null,
             .ivf_postings_is_mmap = false,
             .quantized_vectors = &[_]i8{},
+            .code_dim = 0,
             .binary_vectors = &[_]u64{},
             .binary_words_per_vec = (dimension + 63) / 64,
             .storage_file_path = storage_file_path,
@@ -2472,40 +2477,42 @@ pub const VectorDB = struct {
     /// buffer (must be called whenever quantized_vectors is (re)allocated).
     fn syncBuildCodes(self: *VectorDB) void {
         self.index.build_codes = self.quantized_vectors;
-        self.index.build_dim = if (self.quantized_vectors.len > 0) self.storage.dimension else 0;
+        self.index.build_dim = if (self.quantized_vectors.len > 0) self.code_dim else 0;
     }
 
     /// Grow the quantized-code buffer to cover all stored vectors, encoding
     /// only the new range. Lets graph construction run on i8 kernels.
+    /// Rows are padded to a multiple of 64 (zero lanes) for clean sdot loops.
     fn ensureQuantizedCodes(self: *VectorDB) !void {
         const dim = self.storage.dimension;
+        const cdim = (dim + 63) / 64 * 64;
         const count = self.storage.count;
-        const needed = count * dim;
+        const needed = count * cdim;
         const old_len = self.quantized_vectors.len;
-        if (old_len >= needed) return;
+        if (self.code_dim == cdim and old_len >= needed) return;
+
+        // Stride change (e.g. legacy path wrote unpadded rows): re-encode all.
+        const start_vec = if (self.code_dim == cdim) old_len / cdim else 0;
 
         const grown = try self.allocator.alloc(i8, needed);
-        if (old_len > 0) {
-            @memcpy(grown[0..old_len], self.quantized_vectors);
-            self.allocator.free(self.quantized_vectors);
+        if (start_vec > 0) {
+            @memcpy(grown[0 .. start_vec * cdim], self.quantized_vectors[0 .. start_vec * cdim]);
         }
+        if (old_len > 0) self.allocator.free(self.quantized_vectors);
         self.quantized_vectors = grown;
+        self.code_dim = cdim;
         self.syncBuildCodes();
 
-        const start_vec = old_len / dim;
-        if (comptime StorageScalar == i8) {
-            for (start_vec..count) |i| {
-                @memcpy(self.quantized_vectors[i * dim ..][0..dim], self.storage.getVector(i));
-            }
-        } else {
-            for (start_vec..count) |i| {
-                const vec = self.storage.getVector(i);
-                const dst = self.quantized_vectors[i * dim ..][0..dim];
-                if (comptime StorageScalar == f32) {
-                    VectorOps.quantizeBatch(vec, dst);
-                } else {
-                    for (vec, 0..) |v, d| dst[d] = quantizeValue(VectorOps.toF32(v));
-                }
+        @memset(self.quantized_vectors[start_vec * cdim ..], 0);
+        for (start_vec..count) |i| {
+            const vec = self.storage.getVector(i);
+            const dst = self.quantized_vectors[i * cdim ..][0..dim];
+            if (comptime StorageScalar == i8) {
+                @memcpy(dst, vec);
+            } else if (comptime StorageScalar == f32) {
+                VectorOps.quantizeBatch(vec, dst);
+            } else {
+                for (vec, 0..) |v, d| dst[d] = quantizeValue(VectorOps.toF32(v));
             }
         }
     }
@@ -2674,8 +2681,9 @@ pub const VectorDB = struct {
         if (self.quantized_vectors.len != quant_len) {
             if (self.quantized_vectors.len > 0) self.allocator.free(self.quantized_vectors);
             self.quantized_vectors = try self.allocator.alloc(i8, quant_len);
-            self.syncBuildCodes();
         }
+        self.code_dim = dim; // legacy scan structures use unpadded rows
+        self.syncBuildCodes();
 
         // Binary quantization storage (sign-bit encoding for Hamming pre-filter)
         const bwords = self.binary_words_per_vec;
@@ -3326,11 +3334,11 @@ pub const VectorDB = struct {
 
         // ── Step 6: Reorder quantized vectors ──
         if (self.quantized_vectors.len > 0) {
-            const dim = self.storage.dimension;
+            const qd = self.code_dim;
             var qv_copy = try self.allocator.alloc(i8, self.quantized_vectors.len);
             defer self.allocator.free(qv_copy);
             for (order, 0..) |old, idx| {
-                @memcpy(qv_copy[idx * dim ..][0..dim], self.quantized_vectors[old * dim ..][0..dim]);
+                @memcpy(qv_copy[idx * qd ..][0..qd], self.quantized_vectors[old * qd ..][0..qd]);
             }
             @memcpy(self.quantized_vectors, qv_copy);
         }
@@ -3531,15 +3539,17 @@ pub const VectorDB = struct {
     /// vs f32), then an exact rerank of the surviving candidates.
     fn searchGraphQuantized(self: *VectorDB, normalized_query: []const f32, k: usize) ![]SearchResult {
         const dim = self.storage.dimension;
+        const cdim = if (self.code_dim > 0) self.code_dim else dim;
         const qv = self.quantized_vectors;
 
         var query_q8_stack: [2048]i8 = undefined;
-        const query_q8 = if (dim <= query_q8_stack.len)
-            query_q8_stack[0..dim]
+        const query_q8 = if (cdim <= query_q8_stack.len)
+            query_q8_stack[0..cdim]
         else
-            try self.allocator.alloc(i8, dim);
-        defer if (dim > query_q8_stack.len) self.allocator.free(query_q8);
-        VectorOps.quantizeBatch(normalized_query, query_q8);
+            try self.allocator.alloc(i8, cdim);
+        defer if (cdim > query_q8_stack.len) self.allocator.free(query_q8);
+        VectorOps.quantizeBatch(normalized_query, query_q8[0..dim]);
+        @memset(query_q8[dim..], 0);
 
         self.index.build_rwlock.lockShared();
         defer self.index.build_rwlock.unlockShared();
@@ -3547,7 +3557,7 @@ pub const VectorDB = struct {
         // Greedy descent: find a good layer-0 entry point with cheap i8 hops.
         var entry = self.index.entry_point.?;
         var entry_dist: f32 = blk: {
-            const dot = VectorOps.dotI8(query_q8, qv[entry * dim ..][0..dim]);
+            const dot = VectorOps.dotI8(query_q8, qv[entry * cdim ..][0..cdim]);
             break :blk 1.0 - @as(f32, @floatFromInt(dot)) * INT8_INV_SCALE_SQ;
         };
         var level: usize = self.index.nodes.items[entry].level;
@@ -3557,7 +3567,7 @@ pub const VectorDB = struct {
                 changed = false;
                 const connections = self.index.getConnections(entry, level);
                 for (connections) |neighbor| {
-                    const dot = VectorOps.dotI8(query_q8, qv[neighbor * dim ..][0..dim]);
+                    const dot = VectorOps.dotI8(query_q8, qv[neighbor * cdim ..][0..cdim]);
                     const dist = 1.0 - @as(f32, @floatFromInt(dot)) * INT8_INV_SCALE_SQ;
                     if (dist < entry_dist) {
                         entry_dist = dist;
@@ -3573,9 +3583,9 @@ pub const VectorDB = struct {
             self.index.flat0_stride == self.index.m * 2 and
             self.index.flat0_lens.len == self.index.nodes.items.len;
         const all_items = if (use_flat)
-            try self.index.searchLayer0FlatI8(query_q8, qv, dim, entry, ef)
+            try self.index.searchLayer0FlatI8(query_q8, qv, cdim, entry, ef)
         else
-            try self.index.searchLayerI8(query_q8, qv, dim, entry, ef, 0);
+            try self.index.searchLayerI8(query_q8, qv, cdim, entry, ef, 0);
         if (all_items.len == 0) return self.searchHnsw(normalized_query, k);
 
         // Exact rerank of the top i8-ranked candidates. The i8 ordering error
@@ -3595,7 +3605,7 @@ pub const VectorDB = struct {
                 const next_vec = self.storage.getVector(items[i + 1].idx);
                 @prefetch(next_vec.ptr, .{ .rw = .read, .locality = 0, .cache = .data });
             }
-            const dist = self.distanceToStored(normalized_query, query_q8, item.idx);
+            const dist = self.distanceToStored(normalized_query, query_q8[0..dim], item.idx);
 
             if (heap_len < heap_k) {
                 heap[heap_len] = .{ .idx = item.idx, .distance = dist, .vector = self.resultVectorSlice(item.idx) };
