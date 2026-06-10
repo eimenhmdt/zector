@@ -78,6 +78,24 @@ class ZectorDB:
         self._ptr = _lib.zector_init(dim, max_elements, m, ef_construction)
         if not self._ptr:
             raise RuntimeError("Failed to initialize ZectorDB")
+        # Reusable per-instance buffers: searching is the hot path, so avoid
+        # allocating numpy arrays and re-deriving ctypes pointers per query.
+        self._search = _lib.zector_search
+        self._query_buf = np.empty(dim, dtype=np.float32)
+        self._query_ptr = _f32_ptr(self._query_buf)
+        self._out_k = 0
+        self._out_ids = None
+        self._out_dists = None
+        self._out_ids_ptr = None
+        self._out_dists_ptr = None
+
+    def _ensure_out(self, k):
+        if k != self._out_k:
+            self._out_ids = np.empty(k, dtype=np.uint64)
+            self._out_dists = np.empty(k, dtype=np.float32)
+            self._out_ids_ptr = _u64_ptr(self._out_ids)
+            self._out_dists_ptr = _f32_ptr(self._out_dists)
+            self._out_k = k
 
     def add(self, vector):
         """Add a single vector. Returns its index."""
@@ -124,15 +142,20 @@ class ZectorDB:
         Returns:
             (ids, distances) - numpy arrays of shape (found,)
         """
-        q = np.ascontiguousarray(query, dtype=np.float32).ravel()
-        if q.shape[0] != self.dim:
-            raise ValueError(f"Expected dimension {self.dim}, got {q.shape[0]}")
-        out_ids = np.zeros(k, dtype=np.uint64)
-        out_dists = np.zeros(k, dtype=np.float32)
-        found = _lib.zector_search(self._ptr, _f32_ptr(q), k, _u64_ptr(out_ids), _f32_ptr(out_dists))
+        if isinstance(query, np.ndarray) and query.dtype == np.float32 and query.ndim == 1:
+            if query.shape[0] != self.dim:
+                raise ValueError(f"Expected dimension {self.dim}, got {query.shape[0]}")
+            np.copyto(self._query_buf, query)
+        else:
+            q = np.ascontiguousarray(query, dtype=np.float32).ravel()
+            if q.shape[0] != self.dim:
+                raise ValueError(f"Expected dimension {self.dim}, got {q.shape[0]}")
+            self._query_buf[:] = q
+        self._ensure_out(k)
+        found = self._search(self._ptr, self._query_ptr, k, self._out_ids_ptr, self._out_dists_ptr)
         if found < 0:
             raise RuntimeError("Search failed")
-        return out_ids[:found], out_dists[:found]
+        return self._out_ids[:found].copy(), self._out_dists[:found].copy()
 
     def batch_search(self, queries, k=10):
         """Search multiple queries. Returns lists of (ids, dists) per query."""
