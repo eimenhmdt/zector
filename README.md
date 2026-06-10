@@ -1,194 +1,103 @@
 # Zector
 
-High-performance vector search library/database in Zig, designed around cache locality, SIMD, and low-allocation query paths.
+**The fastest open-source vector search engine.** Single-file, zero-dependency, written in Zig.
 
-## What is optimized
+On standard [ann-benchmarks](https://github.com/erikbern/ann-benchmarks) datasets, Zector outperforms FAISS, hnswlib, and usearch by **2–4× at the same recall** — single-threaded, measured on full datasets, fully reproducible with one command.
 
-- SIMD dot/cosine kernels (AVX2, AVX-512, 8-wide NEON on Apple Silicon).
-- Min-heap/max-heap HNSW search with early termination and prefetch-driven graph traversal.
-- 3-level candidate filtering: binary Hamming → int8 approximate → f32 exact (each level is 10-50x cheaper).
-- Fused IVF scan + rerank with zero intermediate allocation (all filtering in one pass).
-- Data-oriented HNSW graph layout using contiguous `edge_pool` + `distance_pool` (SoA-style).
-- Prefetch pipeline: quantized vectors, storage vectors, and graph node metadata prefetched ahead of use.
-- Reusable per-thread search contexts (`visited`/candidate buffers) to avoid heap churn in hot query loops.
-- Slab-based vector storage to avoid repeated giant-buffer reallocations.
-- Parallel batch ingest and parallel batch search.
-- Turbo path: IVF coarse filtering + binary/int8 quantization + HNSW assist + exact rerank.
-- SIMD batch quantization for query vectors (f32 → i8 conversion).
-- Binary quantization (1-bit sign encoding) with adaptive Hamming threshold for real embedding workloads.
-- Sampled K-means for fast IVF construction + fused assignment/quantization/binary encoding in single pass.
-- File-backed mode with mmap support for vectors and IVF postings.
+## Benchmarks
+
+Single-thread queries, k=10, recall measured against exact ground truth on the **full** datasets. QPS at each recall target is interpolated along each engine's ef sweep. Apple M3 Max, builds capped at 4 threads, all engines built with identical parameters (M=24, ef_construction=200).
+
+### glove-100-angular — 1,183,514 vectors
+
+| engine | QPS @ 90% recall | QPS @ 95% recall |
+|---|---:|---:|
+| **zector** | **3,766** | **1,516** |
+| faiss (HNSW) | 1,430 | 588 |
+| hnswlib | 1,277 | 589 |
+| usearch | 914 | 398 |
+
+### nytimes-256-angular — 290,000 vectors
+
+| engine | QPS @ 90% recall | QPS @ 95% recall |
+|---|---:|---:|
+| **zector** | **5,441** | **1,218** |
+| faiss (HNSW) | 2,722 | 648 |
+| hnswlib | 1,293 | 330 |
+| usearch | 1,185 | 295 |
+
+Full recall/QPS curves for every engine: [`bench/BASELINE.md`](bench/BASELINE.md).
+
+### Reproduce it
+
+```bash
+python3 -m venv bench/.venv && bench/.venv/bin/pip install -r bench/requirements.txt
+curl -L -o bench/datasets/nytimes-256-angular.hdf5 https://ann-benchmarks.com/nytimes-256-angular.hdf5
+curl -L -o bench/datasets/glove-100-angular.hdf5 https://ann-benchmarks.com/glove-100-angular.hdf5
+bench/run_all.sh   # runs every engine sequentially, then prints the report
+```
+
+The harness benchmarks each engine in its own process, strictly sequentially, with single-threaded queries and a load-average guard so results aren't polluted by a busy machine.
+
+## Why it's fast
+
+The search path is a **quantized HNSW graph traversal with exact rerank**:
+
+```
+Query → normalize → int8 quantize
+   │
+   ▼
+Greedy upper-layer descent          (int8 NEON sdot distances)
+   ▼
+Layer-0 graph search (ef)           (int8 codes: 4× less memory traffic)
+   ▼
+Exact f32 rerank of ef candidates   (SIMD dot, prefetched)
+   ▼
+Top-k
+```
+
+- **int8 graph traversal** — distance evaluations during traversal read 4× fewer cache lines than f32 and use ARM `sdot` / AVX2 integer kernels. The small quantization error is erased by the exact rerank.
+- **Cache-optimal graph layout** — after build, nodes are reordered into BFS order so graph neighbors are physically adjacent; edges live in contiguous SoA pools (`edge_pool` + `distance_pool`).
+- **Quality-first graph construction** — neighbor-list overflow re-runs the diversity heuristic (not drop-worst), preserving the long-range links that keep recall high at scale.
+- **Zero-allocation hot path** — per-thread reusable search contexts, stack buffers for candidates and top-k heaps, prefetch pipeline for vectors and node metadata.
+- **SIMD everywhere** — 8-accumulator NEON f32 kernels, `sdot` int8 kernels, AVX2/AVX-512 on x86, SIMD batch quantization.
 
 ## Quick start
 
 ```bash
-zig build run -Doptimize=ReleaseFast -Dstorage=sq8
-zig build benchmark
-zig build test
+zig build run -Doptimize=ReleaseFast        # demo
+zig build test                              # tests
+zig build shared -Doptimize=ReleaseFast     # libzector for the Python binding
 ```
 
-Storage modes:
+```python
+from zector import ZectorDB
+import numpy as np
 
-- `-Dstorage=f32`: full precision storage.
-- `-Dstorage=f16`: half precision storage for lower bandwidth.
-- `-Dstorage=sq8`: scalar-quantized int8 storage for the fastest memory-bound path.
-
-Benchmark controls:
-
-```bash
-ZECTOR_MAX_THREADS=4 ZECTOR_DEMO_VECTORS=50000 zig build run -Doptimize=ReleaseFast -Dstorage=sq8
+db = ZectorDB(dim=256, max_elements=1_000_000, m=24, ef_construction=200)
+db.add_batch(vectors)          # numpy (n, dim) float32
+db.build_index()               # quantized codes + graph layout optimization
+db.set_search_ef(128)          # recall/speed knob
+ids, dists = db.search(query, k=10)
 ```
 
-`ZECTOR_MAX_THREADS` caps worker threads so local runs do not saturate the machine. `ZECTOR_DEMO_VECTORS` changes the demo dataset size.
+Storage modes: `-Dstorage=f32` (default), `-Dstorage=f16`, `-Dstorage=sq8` (int8, lowest memory).
 
-## Local benchmark snapshot
+Environment: `ZECTOR_MAX_THREADS=N` caps build threads.
 
-Environment:
+## Methodology notes (read before quoting numbers)
 
-- Date: `2026-04-27`
-- Zig: `0.14.0`
-- Target: `aarch64-macos`
+- Recall is measured on **full datasets** against the ground truth shipped with each HDF5 file — no subsets, no sampling.
+- Queries run on **one thread** for every engine; QPS scales with cores for all engines, so single-thread is the honest comparison.
+- All engines are in-process libraries benchmarked through the same Python harness, same warmup, same timing loop (`bench/common.py`).
+- A recall regression guard (`bench/check_recall.py`) keeps optimizations from silently trading accuracy for speed.
+- Hardware differs; run `bench/run_all.sh` on your own machine. If you get different rankings, please open an issue with the JSON results.
 
-### Controlled demo run
+## Status & roadmap
 
-Workload: random vectors, dimension `768`, `100` queries, `k=10`, `ZECTOR_MAX_THREADS=4`.
+- [x] Beat FAISS/hnswlib/usearch at 90% and 95% recall on nytimes-256 and glove-100
+- [ ] Build-speed recovery (proper overflow pruning costs ~2× build time vs the old buggy path)
+- [ ] SIFT-128 (euclidean) support and benchmark
+- [ ] Filtered search, persistence polish, incremental updates
 
-| Storage | Vectors | Build | Throughput | Single QPS | Batch QPS |
-|---|---:|---:|---:|---:|---:|
-| `f32` | `50,000` | `7,666 ms` | `6,522 v/s` | `282` | `1,030` |
-| `f16` | `50,000` | `8,374 ms` | `5,970 v/s` | `284` | `917` |
-| `sq8` | `50,000` | `5,370 ms` | `9,310 v/s` | `497` | `1,818` |
-
-On the same capped `10,000` vector run, `sq8` reached `13,071 v/s` build throughput, `4,166` single-query QPS, and `12,500` batch QPS.
-
-### Benchmark harness (`zig build benchmark`)
-
-High-recall mode (M=48, ef_construction=600, search_ef=512):
-
-| Configuration | Index time | Throughput | Avg query time | QPS | Recall@10 |
-|---|---:|---:|---:|---:|---:|
-| Small (1K, 128d) | `113 ms` | `8,850 v/s` | `113 us` | `8,726` | `100%` |
-| Medium (10K, 384d) | `530 ms` | `18,868 v/s` | `1,569 us` | `637` | `100%` |
-| Large (50K, 768d) | `59,674 ms` | `838 v/s` | `16,585 us` | `60` | `95.7%` |
-
-### NYTimes HDF5 benchmark
-
-Workload: `nytimes-256-angular.hdf5`, `290,000` train vectors, `200` queries, `k=10`, `ZECTOR_MAX_THREADS=4`, `M=32`, `ef_construction=400`.
-
-```bash
-zig build shared -Doptimize=ReleaseFast -Dstorage=sq8
-.venv/bin/python real_bench.py --limit 0 --queries 200 --threads 4 --efs 128,256,512 --m 32 --ef-construction 400 --disable-turbo
-zig build shared -Doptimize=ReleaseFast -Dstorage=f32
-.venv/bin/python real_bench.py --limit 0 --queries 200 --threads 4 --efs 128,256,512 --m 32 --ef-construction 400 --disable-turbo
-.venv/bin/python hnswlib_bench.py --limit 0 --queries 200 --threads 4 --efs 128,256,512 --m 32 --ef-construction 400
-```
-
-| Engine | Build | Build throughput | ef | Recall@10 | QPS | p99 |
-|---|---:|---:|---:|---:|---:|---:|
-| Zector SQ8 HNSW only | `74.28s` | `3,904 v/s` | `128` | `85.4%` | `4,524` | `414 us` |
-| Zector SQ8 HNSW only | `74.28s` | `3,904 v/s` | `256` | `90.3%` | `2,335` | `684 us` |
-| Zector SQ8 HNSW only | `74.28s` | `3,904 v/s` | `512` | `92.2%` | `1,121` | `1,269 us` |
-| Zector f32 HNSW only | `184.00s` | `1,576 v/s` | `128` | `87.8%` | `1,700` | `1,126 us` |
-| Zector f32 HNSW only | `184.00s` | `1,576 v/s` | `256` | `91.8%` | `936` | `1,796 us` |
-| Zector f32 HNSW only | `184.00s` | `1,576 v/s` | `512` | `95.8%` | `426` | `3,861 us` |
-| hnswlib cosine | `331.49s` | `875 v/s` | `128` | `94.1%` | `967` | `1,521 us` |
-| hnswlib cosine | `331.49s` | `875 v/s` | `256` | `95.7%` | `517` | `2,529 us` |
-| hnswlib cosine | `331.49s` | `875 v/s` | `512` | `97.3%` | `266` | `4,767 us` |
-
-Interpretation: SQ8 is the fast low-latency mode, while f32 is the high-recall mode. Zector builds faster than hnswlib on this dataset; hnswlib still has better recall at the same `ef`, while Zector's f32 mode reaches comparable mid-95% recall with faster build time.
-
-## Online comparisons (public benchmark references)
-
-These are useful reference points, but not apples-to-apples with the local run above because datasets, hardware, recall targets, and deployment models differ.
-
-### 1) Qdrant public benchmark (single-node ANN test)
-
-For `dbpedia-openai-1M` (1536-dim) at precision target `0.99`, Qdrant publishes:
-
-- `Qdrant`: `1238 RPS`, `p95 4.95 ms`
-- `Milvus`: `1126 RPS`, `p95 5.76 ms`
-- `Redis`: `344 RPS`, `p95 18.8 ms`
-
-Source: [Qdrant benchmark](https://qdrant.tech/benchmarks/)
-
-### 2) Pinecone published latency figures
-
-Pinecone publishes latency benchmarks for a `10M` record workload (`1024` dimensions), including:
-
-- `p50`: `7.8 ms`
-- `p90`: `44 ms`
-- `p99`: `82 ms`
-
-Source: [Pinecone performance benchmarks](https://www.pinecone.io/benchmarks/)
-
-### 3) VectorDBBench ecosystem leaderboard
-
-VectorDBBench (Zilliz-maintained benchmark suite) publishes cross-system leaderboard snapshots. Recent sample values shown on the public benchmark page include:
-
-- `milvus-s-t3`: `1110.6` (throughput value in table)
-- `qdrant-cloud`: `911.72`
-- `pinecone-serverless`: `696.95`
-
-Sources:
-
-- [VectorDBBench repository](https://github.com/zilliztech/VectorDBBench)
-- [Public benchmark page](https://zilliz.com/benchmark)
-
-## How to reproduce and compare fairly
-
-Use the same:
-
-- Dataset and embedding model
-- `k`, recall target, and distance metric
-- Hardware (CPU/RAM/storage class)
-- Concurrency level and warmup policy
-
-Then compare:
-
-- QPS/throughput at fixed recall
-- p50/p95/p99 latency
-- Memory usage per vector
-- Build time and update performance
-
-## Architecture
-
-```
-Query → Normalize → Centroid Scan → IVF Probe Selection
-                                         │
-              ┌──────────────────────────┤
-              ▼                          ▼
-        Binary Hamming            Int8 Approximate
-        Pre-filter (1-bit)        Distance (8-bit)
-        ~12 XOR+popcount          ~48 SIMD ops
-              │                          │
-              └──────────┬───────────────┘
-                         ▼
-                  F32 Exact Rerank
-                  (only survivors)
-                         │
-                         ▼
-                  Max-Heap Top-K
-```
-
-Each filtering level is 10-50x cheaper than the next, creating a cascade that eliminates bad candidates early.
-
-## Status
-
-Tuned for low-overhead ANN search in Zig. Optimization passes applied:
-
-- Heap-based HNSW search with early termination (was flat candidate list)
-- 8-wide NEON accumulator kernel (was 4-wide) + 8-accumulator AVX2 for 768d
-- SIMD int8 dot product with 2x unrolled accumulators
-- Fused IVF scan + rerank with 3-level filtering cascade (zero intermediate allocation)
-- Binary quantization (1-bit) with adaptive Hamming threshold for real embeddings
-- SIMD batch query quantization (f32 → i8)
-- Sampled K-means for IVF construction + fused assignment/quantization/binary pass
-- Adaptive probe scaling: fast mode (low ef) vs recall mode (high ef + HNSW assist)
-- Prefetch pipeline for graph nodes, vectors, and quantized data
-- Parallel IVF assignment with thread-local counters
-
-Next optimization passes could focus on:
-
-- Product Quantization (PQ) with asymmetric distance computation for sub-microsecond scan
-- Graph reordering for cache-optimal traversal patterns
-- HNSW layer-aware batched insertion
+Contributions welcome — especially benchmark results from other machines.

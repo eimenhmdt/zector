@@ -7,7 +7,7 @@ cd "$(dirname "$0")/.."
 PY=bench/.venv/bin/python
 DATASETS=(bench/datasets/nytimes-256-angular.hdf5 bench/datasets/glove-100-angular.hdf5)
 ENGINES=(zector hnswlib usearch faiss)
-EFS="${EFS:-16,24,32,48,64,96,128,192,256}"
+EFS="${EFS:-16,24,32,48,64,96,128,192,256,384,512,768}"
 QUERIES="${QUERIES:-0}"
 
 wait_for_quiet() {
