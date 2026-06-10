@@ -1,8 +1,8 @@
 # Zector
 
-**The fastest open-source vector search engine.** Single-file, zero-dependency, written in Zig.
+**A blazingly fast open-source vector search engine.** Single-file, zero-dependency, written in Zig.
 
-On standard [ann-benchmarks](https://github.com/erikbern/ann-benchmarks) datasets, Zector outperforms FAISS, hnswlib, and usearch by **2–4× at the same recall** — single-threaded, measured on full datasets, fully reproducible with one command.
+On standard [ann-benchmarks](https://github.com/erikbern/ann-benchmarks) datasets, Zector outperforms FAISS, hnswlib, and usearch by **2–4× at the same recall** — single-threaded, measured on full datasets with identical build parameters for every engine, fully reproducible with one command.
 
 ## Benchmarks
 
@@ -91,11 +91,13 @@ Environment: `ZECTOR_MAX_THREADS=N` caps build threads.
 - Queries run on **one thread** for every engine; QPS scales with cores for all engines, so single-thread is the honest comparison.
 - All engines are in-process libraries benchmarked through the same Python harness, same warmup, same timing loop (`bench/common.py`).
 - A recall regression guard (`bench/check_recall.py`) keeps optimizations from silently trading accuracy for speed.
+- All engines were built with the **same parameters** (M=24, ef_construction=200). Per-engine tuning (higher M/efC, usearch's native i8 mode) may shift the curves; a tuned-config comparison round is on the roadmap.
 - Hardware differs; run `bench/run_all.sh` on your own machine. If you get different rankings, please open an issue with the JSON results.
 
 ## Status & roadmap
 
-- [x] Beat FAISS/hnswlib/usearch at 90% and 95% recall on nytimes-256 and glove-100
+- [x] Beat FAISS/hnswlib/usearch at 90% and 95% recall on nytimes-256 and glove-100 (identical-parameters protocol)
+- [ ] Steelman round: tuned competitor configs (M=32/efC=500) + usearch native i8
 - [ ] Build-speed recovery (proper overflow pruning costs ~2× build time vs the old buggy path)
 - [ ] SIFT-128 (euclidean) support and benchmark
 - [ ] Filtered search, persistence polish, incremental updates
