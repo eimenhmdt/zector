@@ -12,7 +12,7 @@ Single-thread queries, k=10, recall measured against exact ground truth on the *
 
 | engine | build (s) | QPS @ 90% recall | QPS @ 95% recall |
 |---|---:|---:|---:|
-| **zector** | 233 | **3,590** | **1,452** |
+| **zector** | 230 | **4,083** | **1,816** |
 | faiss (HNSW) | 218 | 1,430 | 588 |
 | hnswlib | 265 | 1,277 | 589 |
 | usearch | 340 | 914 | 398 |
@@ -21,7 +21,7 @@ Single-thread queries, k=10, recall measured against exact ground truth on the *
 
 | engine | build (s) | QPS @ 90% recall | QPS @ 95% recall |
 |---|---:|---:|---:|
-| **zector** | **58** | **5,786** | **1,369** |
+| **zector** | **59** | **6,323** | **1,577** |
 | faiss (HNSW) | 70 | 2,722 | 648 |
 | hnswlib | 144 | 1,293 | 330 |
 | usearch | 160 | 1,185 | 295 |
@@ -57,7 +57,7 @@ Top-k
 ```
 
 - **int8 graph traversal** — distance evaluations during traversal read 4× fewer cache lines than f32 and use ARM `sdot` / AVX2 integer kernels. The small quantization error is erased by the exact rerank.
-- **Cache-optimal graph layout** — after build, nodes are reordered into BFS order so graph neighbors are physically adjacent; edges live in contiguous SoA pools (`edge_pool` + `distance_pool`).
+- **Cache-optimal graph layout** — after build, nodes are reordered into BFS order so graph neighbors are physically adjacent, and layer-0 adjacency is snapshotted into a flat fixed-stride u32 array: half the edge memory traffic, no pointer chasing, zero node-metadata loads in the hot loop.
 - **Quality-first graph construction** — neighbor-list overflow re-runs the diversity heuristic (not drop-worst), preserving the long-range links that keep recall high at scale.
 - **int8 construction too** — insert-time graph searches and the neighbor-selection heuristic run on i8 kernels (vectors are quantized once at ingest), making builds faster than FAISS while query-time reranking stays exact f32.
 - **Zero-allocation hot path** — per-thread reusable search contexts, stack buffers for candidates and top-k heaps, prefetch pipeline for vectors and node metadata.
