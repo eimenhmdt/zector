@@ -3375,10 +3375,15 @@ pub const VectorDB = struct {
         }
 
         const ef = @max(self.search_ef, k);
-        const items = try self.index.searchLayerI8(query_q8, qv, dim, entry, ef, 0);
-        if (items.len == 0) return self.searchHnsw(normalized_query, k);
+        const all_items = try self.index.searchLayerI8(query_q8, qv, dim, entry, ef, 0);
+        if (all_items.len == 0) return self.searchHnsw(normalized_query, k);
 
-        // Exact rerank of the i8-ranked candidates.
+        // Exact rerank of the top i8-ranked candidates. The i8 ordering error
+        // is tiny (unit vectors, 127 scale), so only the head of the list can
+        // plausibly contain true top-k members; reranking all ef candidates
+        // wastes f32 memory traffic.
+        const rerank_count = @min(all_items.len, @max(k * 4, 64));
+        const items = all_items[0..rerank_count];
         const heap_k = @min(k, items.len);
         var heap_buf: [64]SearchResult = undefined;
         const heap = if (heap_k <= 64) heap_buf[0..heap_k] else try self.allocator.alloc(SearchResult, heap_k);
