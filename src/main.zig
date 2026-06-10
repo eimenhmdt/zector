@@ -1162,6 +1162,11 @@ const HNSWIndex = struct {
     edge_pool_mutex: std.Thread.Mutex,
     build_rwlock: std.Thread.RwLock,
     entry_point: ?usize,
+    /// Optional int8 codes (count*dim) used for construction-time distances.
+    /// When set, insert searches and neighbor-selection heuristics run on i8
+    /// kernels (4x less memory traffic than f32). Owned by VectorDB.
+    build_codes: []const i8,
+    build_dim: usize,
     m: usize, // Max connections per layer
     ef_construction: usize,
     ml: f64, // Level multiplier
@@ -1187,6 +1192,8 @@ const HNSWIndex = struct {
             .edge_pool_mutex = .{},
             .build_rwlock = .{},
             .entry_point = null,
+            .build_codes = &[_]i8{},
+            .build_dim = 0,
             .m = m,
             .ef_construction = ef_construction,
             .ml = 1.0 / @log(@as(f64, 2.0)),
@@ -1535,12 +1542,15 @@ const HNSWIndex = struct {
     /// to maintain graph connectivity. Candidates must be sorted by distance ascending.
     /// Returns the number of kept candidates (bubbled to the front of the slice).
     fn selectNeighborsHeuristic(
-        _: *HNSWIndex,
+        self: *HNSWIndex,
         candidates: []SearchItem,
         m_max: usize,
         storage: *const VectorStorage,
     ) usize {
         if (candidates.len <= 1) return @min(candidates.len, m_max);
+
+        const use_q = self.build_codes.len > 0;
+        const qdim = self.build_dim;
 
         var selected_count: usize = 0;
         // Track pruned candidates for backfill (on stack, bounded by input size)
@@ -1551,11 +1561,15 @@ const HNSWIndex = struct {
             if (selected_count >= m_max) break;
 
             var discard = false;
-            const cand_vec = storage.getVector(cand.idx);
+            const cand_vec = if (use_q) &[_]StorageScalar{} else storage.getVector(cand.idx);
+            const cand_q = if (use_q) self.build_codes[cand.idx * qdim ..][0..qdim] else &[_]i8{};
 
             for (candidates[0..selected_count]) |selected| {
-                const sel_vec = storage.getVector(selected.idx);
-                const dist_to_selected = VectorOps.cosineDistanceStorage(cand_vec, sel_vec);
+                const dist_to_selected = if (use_q) blk: {
+                    const sel_q = self.build_codes[selected.idx * qdim ..][0..qdim];
+                    const dot = VectorOps.dotI8(cand_q, sel_q);
+                    break :blk 1.0 - @as(f32, @floatFromInt(dot)) * INT8_INV_SCALE_SQ;
+                } else VectorOps.cosineDistanceStorage(cand_vec, storage.getVector(selected.idx));
 
                 if (dist_to_selected < cand.distance) {
                     discard = true;
@@ -1654,6 +1668,9 @@ const HNSWIndex = struct {
         if (idx == old_entry) return;
 
         const vector = storage.getVector(idx);
+        const use_q = self.build_codes.len > 0;
+        const qdim = self.build_dim;
+        const query_q8 = if (use_q) self.build_codes[idx * qdim ..][0..qdim] else &[_]i8{};
         var current_entry = old_entry;
 
         if (entry_level > level) {
@@ -1662,7 +1679,10 @@ const HNSWIndex = struct {
 
             var l: usize = entry_level;
             while (l > level) : (l -= 1) {
-                const nearest_at_level = try self.searchLayerInsert(vector, current_entry, 1, l, storage);
+                const nearest_at_level = if (use_q)
+                    try self.searchLayerI8(query_q8, self.build_codes, qdim, current_entry, 1, l)
+                else
+                    try self.searchLayerInsert(vector, current_entry, 1, l, storage);
                 if (nearest_at_level.len > 0) {
                     current_entry = nearest_at_level[0].idx;
                 }
@@ -1677,7 +1697,10 @@ const HNSWIndex = struct {
                 self.build_rwlock.lockShared();
                 defer self.build_rwlock.unlockShared();
 
-                const nearest = try self.searchLayerInsert(vector, current_entry, self.ef_construction, link_level, storage);
+                const nearest = if (use_q)
+                    try self.searchLayerI8(query_q8, self.build_codes, qdim, current_entry, self.ef_construction, link_level)
+                else
+                    try self.searchLayerInsert(vector, current_entry, self.ef_construction, link_level, storage);
                 const ctx = if (tl_search_owner == self and tl_search_context != null)
                     tl_search_context.?
                 else
@@ -2331,6 +2354,48 @@ pub const VectorDB = struct {
         self.ivf_postings_is_mmap = false;
     }
 
+    /// Point the index's construction-time codes at the current quantized
+    /// buffer (must be called whenever quantized_vectors is (re)allocated).
+    fn syncBuildCodes(self: *VectorDB) void {
+        self.index.build_codes = self.quantized_vectors;
+        self.index.build_dim = if (self.quantized_vectors.len > 0) self.storage.dimension else 0;
+    }
+
+    /// Grow the quantized-code buffer to cover all stored vectors, encoding
+    /// only the new range. Lets graph construction run on i8 kernels.
+    fn ensureQuantizedCodes(self: *VectorDB) !void {
+        const dim = self.storage.dimension;
+        const count = self.storage.count;
+        const needed = count * dim;
+        const old_len = self.quantized_vectors.len;
+        if (old_len >= needed) return;
+
+        const grown = try self.allocator.alloc(i8, needed);
+        if (old_len > 0) {
+            @memcpy(grown[0..old_len], self.quantized_vectors);
+            self.allocator.free(self.quantized_vectors);
+        }
+        self.quantized_vectors = grown;
+        self.syncBuildCodes();
+
+        const start_vec = old_len / dim;
+        if (comptime StorageScalar == i8) {
+            for (start_vec..count) |i| {
+                @memcpy(self.quantized_vectors[i * dim ..][0..dim], self.storage.getVector(i));
+            }
+        } else {
+            for (start_vec..count) |i| {
+                const vec = self.storage.getVector(i);
+                const dst = self.quantized_vectors[i * dim ..][0..dim];
+                if (comptime StorageScalar == f32) {
+                    VectorOps.quantizeBatch(vec, dst);
+                } else {
+                    for (vec, 0..) |v, d| dst[d] = quantizeValue(VectorOps.toF32(v));
+                }
+            }
+        }
+    }
+
     fn quantizeValue(v: f32) i8 {
         return VectorOps.quantizeUnit(v);
     }
@@ -2382,6 +2447,7 @@ pub const VectorDB = struct {
             if (self.quantized_vectors.len > 0) {
                 self.allocator.free(self.quantized_vectors);
                 self.quantized_vectors = &[_]i8{};
+                self.syncBuildCodes();
             }
             if (self.binary_vectors.len > 0) {
                 self.allocator.free(self.binary_vectors);
@@ -2483,6 +2549,7 @@ pub const VectorDB = struct {
         if (self.quantized_vectors.len != quant_len) {
             if (self.quantized_vectors.len > 0) self.allocator.free(self.quantized_vectors);
             self.quantized_vectors = try self.allocator.alloc(i8, quant_len);
+            self.syncBuildCodes();
         }
 
         // Binary quantization storage (sign-bit encoding for Hamming pre-filter)
@@ -3196,6 +3263,7 @@ pub const VectorDB = struct {
 
         const idx = try self.storage.addVector(vector);
         try self.internal_to_external.append(idx);
+        try self.ensureQuantizedCodes();
         try self.index.insert(idx, &self.storage);
         self.turbo_dirty = true;
 
@@ -3963,6 +4031,8 @@ pub const VectorDB = struct {
 
         // Fill storage first, then pre-allocate nodes so insert workers avoid global write-lock convoy.
         const start_idx = try self.storage.appendBatchNormalized(vectors);
+        // Quantize new vectors up front so graph construction runs on i8 kernels.
+        try self.ensureQuantizedCodes();
         try self.index.reserveCapacity(start_idx + vectors.len);
 
         // Track external IDs (at insertion time, external == physical)
