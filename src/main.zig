@@ -1162,6 +1162,12 @@ const HNSWIndex = struct {
     edge_pool_mutex: std.Thread.Mutex,
     build_rwlock: std.Thread.RwLock,
     entry_point: ?usize,
+    /// Flat u32 layer-0 adjacency (CSR with fixed stride m*2), rebuilt by
+    /// buildFlatLayer0 after construction. Halves edge memory traffic and
+    /// removes node-metadata loads from the layer-0 hot loop.
+    flat0_edges: []u32,
+    flat0_lens: []u32,
+    flat0_stride: usize,
     /// Optional int8 codes (count*dim) used for construction-time distances.
     /// When set, insert searches and neighbor-selection heuristics run on i8
     /// kernels (4x less memory traffic than f32). Owned by VectorDB.
@@ -1192,6 +1198,9 @@ const HNSWIndex = struct {
             .edge_pool_mutex = .{},
             .build_rwlock = .{},
             .entry_point = null,
+            .flat0_edges = &[_]u32{},
+            .flat0_lens = &[_]u32{},
+            .flat0_stride = 0,
             .build_codes = &[_]i8{},
             .build_dim = 0,
             .m = m,
@@ -1215,6 +1224,8 @@ const HNSWIndex = struct {
         self.edge_pool.deinit();
         self.distance_pool.deinit();
         if (self.level_cursors.len > 0) self.allocator.free(self.level_cursors);
+        if (self.flat0_edges.len > 0) self.allocator.free(self.flat0_edges);
+        if (self.flat0_lens.len > 0) self.allocator.free(self.flat0_lens);
         if (self.scratch_idx.len > 0) self.allocator.free(self.scratch_idx);
         if (self.scratch_visited.len > 0) self.allocator.free(self.scratch_visited);
         if (self.scratch_candidates.len > 0) self.allocator.free(self.scratch_candidates);
@@ -1937,6 +1948,105 @@ const HNSWIndex = struct {
         return w_items[0..w_len];
     }
 
+    /// Snapshot layer-0 adjacency into a flat fixed-stride u32 array.
+    /// Must be rebuilt after any inserts (callers go through rebuildTurboIndex).
+    fn buildFlatLayer0(self: *HNSWIndex) !void {
+        const n = self.nodes.items.len;
+        const stride = self.m * 2;
+        if (n == 0 or n > std.math.maxInt(u32)) return;
+
+        if (self.flat0_edges.len != n * stride) {
+            if (self.flat0_edges.len > 0) self.allocator.free(self.flat0_edges);
+            self.flat0_edges = try self.allocator.alloc(u32, n * stride);
+        }
+        if (self.flat0_lens.len != n) {
+            if (self.flat0_lens.len > 0) self.allocator.free(self.flat0_lens);
+            self.flat0_lens = try self.allocator.alloc(u32, n);
+        }
+        self.flat0_stride = stride;
+
+        for (0..n) |i| {
+            const conns = self.getConnections(i, 0);
+            const len = @min(conns.len, stride);
+            self.flat0_lens[i] = @intCast(len);
+            const dst = self.flat0_edges[i * stride ..][0..len];
+            for (conns[0..len], 0..) |c, j| dst[j] = @intCast(c);
+        }
+    }
+
+    /// Layer-0 search over the flat u32 adjacency + int8 codes. The hot loop
+    /// touches only three arrays (flat edges, codes, visited) — no node
+    /// metadata, no edge-pool indirection.
+    fn searchLayer0FlatI8(
+        self: *HNSWIndex,
+        query_q8: []const i8,
+        quantized_vectors: []const i8,
+        dim: usize,
+        entry: usize,
+        num_closest: usize,
+    ) ![]SearchItem {
+        const ef = @max(num_closest, 1);
+        const ctx = try self.acquireSearchContext(ef, self.nodes.items.len);
+        const visited = ctx.visited;
+        const mark = ctx.mark;
+        const c_items = ctx.candidates;
+        const w_items = ctx.w;
+        var c_len: usize = 0;
+        var w_len: usize = 0;
+
+        var bloom: BloomFilter = @splat(0);
+
+        const stride = self.flat0_stride;
+        const edges = self.flat0_edges;
+        const lens = self.flat0_lens;
+
+        const entry_q = quantized_vectors[entry * dim ..][0..dim];
+        const entry_dot = VectorOps.dotI8(query_q8, entry_q);
+        const entry_dist = 1.0 - @as(f32, @floatFromInt(entry_dot)) * INT8_INV_SCALE_SQ;
+        const entry_item = SearchItem{ .idx = entry, .distance = entry_dist };
+        sortedInsertDesc(c_items, &c_len, entry_item);
+        sortedInsertAsc(w_items, &w_len, ef, entry_item);
+        markVisited(&bloom, visited, entry, mark);
+
+        while (c_len > 0) {
+            const current = sortedPopMin(c_items, &c_len);
+            if (w_len >= ef and current.distance > sortedWorstDist(w_items, w_len)) break;
+
+            const base = current.idx * stride;
+            const conn_len = lens[current.idx];
+            const conns = edges[base .. base + conn_len];
+
+            const pf_count = @min(conns.len, 8);
+            for (conns[0..pf_count]) |neighbor| {
+                @prefetch(quantized_vectors.ptr + @as(usize, neighbor) * dim, .{ .rw = .read, .locality = 0, .cache = .data });
+            }
+
+            for (conns, 0..) |neighbor32, ci| {
+                const neighbor: usize = neighbor32;
+                if (isVisited(&bloom, visited, neighbor, mark)) continue;
+                markVisited(&bloom, visited, neighbor, mark);
+
+                if (ci + pf_count < conns.len) {
+                    @prefetch(quantized_vectors.ptr + @as(usize, conns[ci + pf_count]) * dim, .{ .rw = .read, .locality = 0, .cache = .data });
+                }
+
+                const qvec = quantized_vectors[neighbor * dim ..][0..dim];
+                const dot_i32 = VectorOps.dotI8(query_q8, qvec);
+                const dist = 1.0 - @as(f32, @floatFromInt(dot_i32)) * INT8_INV_SCALE_SQ;
+
+                if (w_len < ef or dist < sortedWorstDist(w_items, w_len)) {
+                    sortedInsertDesc(c_items, &c_len, .{ .idx = neighbor, .distance = dist });
+                    sortedInsertAsc(w_items, &w_len, ef, .{ .idx = neighbor, .distance = dist });
+                    // Prefetch the new candidate's adjacency row — it's the
+                    // likely next hop.
+                    @prefetch(edges.ptr + neighbor * stride, .{ .rw = .read, .locality = 1, .cache = .data });
+                }
+            }
+        }
+
+        return w_items[0..w_len];
+    }
+
     /// Int8-accelerated graph search for HNSW assist path.
     /// Uses quantized int8 distances (~10x cheaper than f32) for graph traversal.
     /// Returns candidate IDs with approximate distances — caller reranks with f32.
@@ -2177,6 +2287,9 @@ pub const VectorDB = struct {
     search_ef: usize,
     turbo_enabled: bool,
     turbo_dirty: bool,
+    /// Build the legacy IVF scan structures (centroids/postings/PQ4/binary).
+    /// The quantized-graph path doesn't need them; off by default.
+    ivf_scan_enabled: bool,
     ivf_min_vectors: usize,
     ivf_nlist: usize,
     ivf_probes: usize,
@@ -2243,6 +2356,7 @@ pub const VectorDB = struct {
             .search_ef = 128,
             .turbo_enabled = options.enable_turbo,
             .turbo_dirty = true,
+            .ivf_scan_enabled = false,
             .ivf_min_vectors = options.ivf_min_vectors,
             .ivf_nlist = options.ivf_nlist,
             .ivf_probes = @max(options.ivf_probes, 1),
@@ -2465,6 +2579,17 @@ pub const VectorDB = struct {
             return;
         }
 
+        // Lean path: the quantized-graph search needs only i8 codes and the
+        // cache-optimal layout — skip IVF training, PQ4 codebooks, and binary
+        // encoding entirely unless the legacy scan is explicitly enabled.
+        if (!self.ivf_scan_enabled) {
+            try self.ensureQuantizedCodes();
+            self.turbo_dirty = false;
+            try self.compactGraphLayout();
+            try self.index.buildFlatLayer0();
+            return;
+        }
+
         const auto_nlist = std.math.clamp(
             @as(usize, @intFromFloat(@sqrt(@as(f64, @floatFromInt(count))))),
             IVF_MIN_LISTS,
@@ -2663,6 +2788,7 @@ pub const VectorDB = struct {
 
         // Reorder graph nodes into BFS traversal order for cache-optimal search
         try self.compactGraphLayout();
+        try self.index.buildFlatLayer0();
     }
 
     /// Train PQ codebook using sampled K-means and encode all vectors.
@@ -3443,7 +3569,13 @@ pub const VectorDB = struct {
         }
 
         const ef = @max(self.search_ef, k);
-        const all_items = try self.index.searchLayerI8(query_q8, qv, dim, entry, ef, 0);
+        const use_flat = self.index.flat0_edges.len > 0 and
+            self.index.flat0_stride == self.index.m * 2 and
+            self.index.flat0_lens.len == self.index.nodes.items.len;
+        const all_items = if (use_flat)
+            try self.index.searchLayer0FlatI8(query_q8, qv, dim, entry, ef)
+        else
+            try self.index.searchLayerI8(query_q8, qv, dim, entry, ef, 0);
         if (all_items.len == 0) return self.searchHnsw(normalized_query, k);
 
         // Exact rerank of the top i8-ranked candidates. The i8 ordering error
@@ -4568,6 +4700,7 @@ test "turbo IVF uses mmap postings for file-backed mode" {
         .ivf_rerank_factor = 4,
     });
     defer db.deinit();
+    db.ivf_scan_enabled = true; // exercise the legacy IVF scan structures
 
     var rng = std.Random.DefaultPrng.init(1234);
     const vectors = try allocator.alloc([8]f32, 128);
