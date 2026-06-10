@@ -10,21 +10,21 @@ Single-thread queries, k=10, recall measured against exact ground truth on the *
 
 ### glove-100-angular — 1,183,514 vectors
 
-| engine | QPS @ 90% recall | QPS @ 95% recall |
-|---|---:|---:|
-| **zector** | **3,766** | **1,516** |
-| faiss (HNSW) | 1,430 | 588 |
-| hnswlib | 1,277 | 589 |
-| usearch | 914 | 398 |
+| engine | build (s) | QPS @ 90% recall | QPS @ 95% recall |
+|---|---:|---:|---:|
+| **zector** | 233 | **3,590** | **1,452** |
+| faiss (HNSW) | 218 | 1,430 | 588 |
+| hnswlib | 265 | 1,277 | 589 |
+| usearch | 340 | 914 | 398 |
 
 ### nytimes-256-angular — 290,000 vectors
 
-| engine | QPS @ 90% recall | QPS @ 95% recall |
-|---|---:|---:|
-| **zector** | **5,441** | **1,218** |
-| faiss (HNSW) | 2,722 | 648 |
-| hnswlib | 1,293 | 330 |
-| usearch | 1,185 | 295 |
+| engine | build (s) | QPS @ 90% recall | QPS @ 95% recall |
+|---|---:|---:|---:|
+| **zector** | **58** | **5,786** | **1,369** |
+| faiss (HNSW) | 70 | 2,722 | 648 |
+| hnswlib | 144 | 1,293 | 330 |
+| usearch | 160 | 1,185 | 295 |
 
 Full recall/QPS curves for every engine: [`bench/BASELINE.md`](bench/BASELINE.md).
 
@@ -59,6 +59,7 @@ Top-k
 - **int8 graph traversal** — distance evaluations during traversal read 4× fewer cache lines than f32 and use ARM `sdot` / AVX2 integer kernels. The small quantization error is erased by the exact rerank.
 - **Cache-optimal graph layout** — after build, nodes are reordered into BFS order so graph neighbors are physically adjacent; edges live in contiguous SoA pools (`edge_pool` + `distance_pool`).
 - **Quality-first graph construction** — neighbor-list overflow re-runs the diversity heuristic (not drop-worst), preserving the long-range links that keep recall high at scale.
+- **int8 construction too** — insert-time graph searches and the neighbor-selection heuristic run on i8 kernels (vectors are quantized once at ingest), making builds faster than FAISS while query-time reranking stays exact f32.
 - **Zero-allocation hot path** — per-thread reusable search contexts, stack buffers for candidates and top-k heaps, prefetch pipeline for vectors and node metadata.
 - **SIMD everywhere** — 8-accumulator NEON f32 kernels, `sdot` int8 kernels, AVX2/AVX-512 on x86, SIMD batch quantization.
 
@@ -97,8 +98,8 @@ Environment: `ZECTOR_MAX_THREADS=N` caps build threads.
 ## Status & roadmap
 
 - [x] Beat FAISS/hnswlib/usearch at 90% and 95% recall on nytimes-256 and glove-100 (identical-parameters protocol)
+- [x] Build-speed recovery — int8 construction kernels; builds now faster than FAISS on nytimes (58s vs 70s)
 - [ ] Steelman round: tuned competitor configs (M=32/efC=500) + usearch native i8
-- [ ] Build-speed recovery (proper overflow pruning costs ~2× build time vs the old buggy path)
 - [ ] SIFT-128 (euclidean) support and benchmark
 - [ ] Filtered search, persistence polish, incremental updates
 
