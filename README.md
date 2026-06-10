@@ -12,9 +12,9 @@ Single-thread queries, k=10, recall measured against exact ground truth on the *
 
 | engine | build (s) | QPS @ 90% recall | QPS @ 95% recall |
 |---|---:|---:|---:|
-| **zector** | 230 | **4,083** | **1,816** |
-| faiss (HNSW) | 218 | 1,430 | 588 |
+| **zector** | **195** | **5,828** | **2,222** |
 | hnswlib | 265 | 1,277 | 589 |
+| faiss (HNSW) | 218 | 1,430 | 588 |
 | usearch | 340 | 914 | 398 |
 
 ### nytimes-256-angular — 290,000 vectors
